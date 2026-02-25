@@ -34,6 +34,8 @@ while [[ $# -gt 0 ]]; do
         --dataset)  DATASET_ARG="--dataset $2"; shift 2 ;;
         --output)   OUTPUT="$2";               shift 2 ;;
         --name)     MODEL_NAME="$2"; OUTPUT="./output/$2"; shift 2 ;;
+        --gpu)      GPU_FLAG="--gpu";    shift   ;;
+
         --no-gpu)   GPU_FLAG="";               shift   ;;
         *) echo "[WARN] Unknown argument: $1"; shift ;;
     esac
