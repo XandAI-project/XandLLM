@@ -24,6 +24,3 @@ Cargo.lock
 
 # Docker
 docker/.env
-
-
-/internal/
