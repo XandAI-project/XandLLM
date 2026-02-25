@@ -201,6 +201,12 @@ impl Model for LlamaModel {
             });
         }
 
+        // Reset KV cache before every generation.
+        // Without this, stale K/V data from the previous request leaks into
+        // the attention computation of the new one — corrupting outputs.
+        // Recreating Cache is cheap: it allocates a Vec of Nones.
+        self.cache = Cache::new(true, self.dtype, &self.config, &self.device)?;
+
         let (tx, rx) = mpsc::unbounded_channel::<CoreResult<Token>>();
 
         let mut token_history: Vec<u32> = input.token_ids.clone();
@@ -239,7 +245,15 @@ impl Model for LlamaModel {
             let step_logits = logits_step.i((0, 0))?;
             let next_id = sample_token(&step_logits, &params, &token_history)?;
 
+            // Cap history to the penalty window to prevent unbounded growth.
+            // token_history is only used for penalty computation, not for the
+            // model's KV cache (which is managed separately).
+            let cap = params.repeat_last_n.unwrap_or(usize::MAX);
+            if token_history.len() >= cap {
+                token_history.drain(..token_history.len() - cap + 1);
+            }
             token_history.push(next_id);
+
             let is_eos = params.stop_token_ids.contains(&next_id);
 
             // Don't send stop tokens to output (synchronous generate)
@@ -270,6 +284,9 @@ impl Model for LlamaModel {
                 max: self.max_sequence_length,
             });
         }
+
+        // Reset KV cache before every generation (same reason as in `generate`).
+        self.cache = Cache::new(true, self.dtype, &self.config, &self.device)?;
 
         let mut token_history: Vec<u32> = input.token_ids.clone();
         let max_new = params.max_new_tokens;
@@ -309,7 +326,13 @@ impl Model for LlamaModel {
             let step_logits = logits_step.i((0, 0))?;
             let next_id = sample_token(&step_logits, &params, &token_history)?;
 
+            // Cap history to the penalty window — same reason as generate().
+            let cap = params.repeat_last_n.unwrap_or(usize::MAX);
+            if token_history.len() >= cap {
+                token_history.drain(..token_history.len() - cap + 1);
+            }
             token_history.push(next_id);
+
             let is_eos = params.stop_token_ids.contains(&next_id);
 
             // Don't send stop tokens to output (streaming generate)

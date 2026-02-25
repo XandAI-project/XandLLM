@@ -182,10 +182,10 @@ fn choose_teacher_device(
     };
 
     let model_mb = estimate_model_size_mb(model_dir);
-    // Require: model + 1 GB KV-cache headroom + 4 GB spare for student init/training.
-    // Without the spare, teacher fills VRAM and student construction OOMs even
-    // though the error looks unrelated.
-    let needed_mb = model_mb + 1024 + 4096;
+    // Require: model weights + 1 GB KV-cache headroom.
+    // The student is loaded only after the teacher has been dropped (pipelined
+    // phases), so no student buffer is needed here.
+    let needed_mb = model_mb + 1024;
 
     if free_mb >= needed_mb {
         info!(
@@ -208,7 +208,7 @@ fn choose_teacher_device(
 /// Query free VRAM in MiB via `nvidia-smi`.
 ///
 /// Returns `None` if the command is not found or produces unexpected output.
-fn query_free_vram_mb() -> Option<u64> {
+pub fn query_free_vram_mb() -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output()
@@ -229,7 +229,7 @@ fn query_free_vram_mb() -> Option<u64> {
 /// Sum the sizes of model weight files (`.gguf`, `.safetensors`) in `dir`.
 ///
 /// Returns the total in MiB.  Falls back to 0 if the directory is unreadable.
-fn estimate_model_size_mb(dir: &Path) -> u64 {
+pub fn estimate_model_size_mb(dir: &Path) -> u64 {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return 0,

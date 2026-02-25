@@ -442,7 +442,13 @@ impl Model for QuantizedModel {
             let step_last = last_token_logits(&step_logits, 0)?;
             let next_id = sample_token(&step_last, &params, &token_history)?;
 
+            // Cap history to the penalty window to prevent unbounded Vec growth.
+            let cap = params.repeat_last_n.unwrap_or(usize::MAX);
+            if token_history.len() >= cap {
+                token_history.drain(..token_history.len() - cap + 1);
+            }
             token_history.push(next_id);
+
             let is_eos = params.stop_token_ids.contains(&next_id);
 
             // Don't send stop tokens to output (synchronous generate)
@@ -516,7 +522,13 @@ impl Model for QuantizedModel {
             let step_last = last_token_logits(&step_logits, 0)?;
             let next_id = sample_token(&step_last, &params, &token_history)?;
 
+            // Cap history to the penalty window — same reason as generate().
+            let cap = params.repeat_last_n.unwrap_or(usize::MAX);
+            if token_history.len() >= cap {
+                token_history.drain(..token_history.len() - cap + 1);
+            }
             token_history.push(next_id);
+
             let is_eos = params.stop_token_ids.contains(&next_id);
 
             // Don't send stop tokens to output (streaming generate)

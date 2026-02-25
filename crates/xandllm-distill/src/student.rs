@@ -98,14 +98,33 @@ impl TrainableStudent {
     ///    names (with random initial values).
     /// 3. If `weight_paths` is non-empty, call `varmap.load(path)` for each
     ///    shard to overwrite the random values with pre-trained weights.
+    ///
+    /// ## Dtype strategy (mixed-precision lite)
+    ///
+    /// | Device | Weights dtype | Memory savings vs F32 |
+    /// |--------|---------------|-----------------------|
+    /// | CPU    | F32           | — (BF16 not supported on CPU) |
+    /// | CUDA   | BF16          | ~50 % (1B: 4.4 GB → 2.2 GB) |
+    ///
+    /// The forward pass runs in BF16 on GPU.  The cross-entropy loss is cast to
+    /// F32 before computation (`masked_ce_loss`) to preserve numerical accuracy
+    /// in the probability distribution — this is the standard "mixed-precision
+    /// lite" approach used by llama.cpp and transformers training scripts.
     fn build(
         config: LlamaConfig,
         tokenizer: Arc<Tokenizer>,
         device: &Device,
         weight_paths: &[std::path::PathBuf],
     ) -> Result<Self> {
+        // Use BF16 on CUDA for ~50 % memory savings; fall back to F32 on CPU
+        // (candle does not support BF16 operations on CPU).
+        let dtype = match device {
+            Device::Cuda(_) => DType::BF16,
+            _ => DType::F32,
+        };
+
         let mut varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let vb = VarBuilder::from_varmap(&varmap, dtype, device);
 
         let model = CandleLlama::load(vb, &config)
             .context("Failed to construct student Llama model")?;
@@ -124,7 +143,8 @@ impl TrainableStudent {
 
         // A non-caching Cache is reused across all training forward passes.
         // With use_kv_cache=false the Cache is never written, so reuse is safe.
-        let cache = Cache::new(false, DType::F32, &config, device)
+        // Use the same dtype as the model weights.
+        let cache = Cache::new(false, dtype, &config, device)
             .context("Failed to create training cache")?;
 
         Ok(Self { model, varmap, cache, config, tokenizer, device: device.clone() })
@@ -164,11 +184,16 @@ impl TrainableStudent {
 
     /// Compute cross-entropy loss masked to completion tokens only.
     ///
-    /// * `logits` — `[N, vocab_size]` (already flattened)
+    /// * `logits` — `[N, vocab_size]` (already flattened; may be BF16 or F32)
     /// * `labels` — `[batch, seq_len]` next-token ids (u32)
     /// * `mask`   — `[batch, seq_len]` 1.0 for completion tokens, 0.0 for prompt
     ///
     /// Returns the mean cross-entropy over the masked (completion) positions.
+    ///
+    /// Logits are always cast to F32 before loss computation regardless of the
+    /// model's training dtype.  BF16 softmax is numerically unstable for large
+    /// vocabularies (overflow in exp), so this F32 cast is the standard
+    /// "mixed-precision lite" practice used by llama.cpp, Transformers, and nanoGPT.
     pub fn masked_ce_loss(
         logits: &Tensor,
         labels: &Tensor,
@@ -178,11 +203,18 @@ impl TrainableStudent {
         let (batch, seq) = labels.dims2()?;
         let n = batch * seq;
 
+        // Cast to F32 for stable cross-entropy — cheap GPU dtype conversion.
+        let logits = if logits.dtype() != DType::F32 {
+            logits.to_dtype(DType::F32)?
+        } else {
+            logits.clone()
+        };
+
         let labels_flat = labels.reshape(n)?.to_dtype(DType::U32)?;
         let mask_flat = mask.reshape(n)?.to_dtype(DType::F32)?;
 
         // Per-position cross-entropy → shape [n]
-        let ce = loss::cross_entropy(logits, &labels_flat)
+        let ce = loss::cross_entropy(&logits, &labels_flat)
             .context("cross_entropy computation failed")?;
 
         // Zero-out prompt positions

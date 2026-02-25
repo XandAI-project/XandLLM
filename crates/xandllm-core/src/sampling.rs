@@ -24,18 +24,29 @@ pub fn sample_token(
         return greedy(logits);
     }
 
+    // Apply the repeat_last_n window — cap how far back penalty scans go.
+    // This bounds penalty computation to O(window) instead of O(T) and
+    // prevents unbounded token_history from consuming growing memory,
+    // matching llama.cpp's `repeat_last_n` semantics.
+    let penalty_window: &[u32] = match params.repeat_last_n {
+        Some(n) if n < token_history.len() => {
+            &token_history[token_history.len() - n..]
+        }
+        _ => token_history,
+    };
+
     let mut logits = logits.clone();
 
     // Apply repetition penalty
     if (params.repetition_penalty - 1.0).abs() > f64::EPSILON {
-        logits = apply_repetition_penalty(&logits, token_history, params.repetition_penalty)?;
+        logits = apply_repetition_penalty(&logits, penalty_window, params.repetition_penalty)?;
     }
 
     // Apply frequency and presence penalties
     if params.frequency_penalty.abs() > f64::EPSILON || params.presence_penalty.abs() > f64::EPSILON {
         logits = apply_frequency_presence_penalty(
             &logits,
-            token_history,
+            penalty_window,
             params.frequency_penalty,
             params.presence_penalty,
         )?;

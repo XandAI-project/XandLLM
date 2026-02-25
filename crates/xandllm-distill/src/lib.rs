@@ -40,6 +40,6 @@ pub mod presets;
 pub mod student;
 pub mod teacher;
 
-pub use distiller::{DistillConfig, Distiller};
+pub use distiller::{DistillConfig, Phase1Runner, Phase2Runner, TrainingStats};
 pub use export::OutputFormat;
 pub use presets::SizePreset;

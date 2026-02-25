@@ -4,6 +4,16 @@
 //! Hugging Face before training starts — no separate `xandllm pull` step is
 //! required.
 //!
+//! ## Pipeline
+//!
+//! 1. **Phase 1** — Teacher is loaded (GPU if VRAM allows), generates all
+//!    completions, then is **dropped** before Phase 2 begins, freeing VRAM.
+//! 2. **Phase 2** — Student is loaded on GPU (if VRAM estimate allows) or CPU,
+//!    then trained with AdamW.
+//!
+//! This sequential loading ensures neither phase is memory-limited by the
+//! other model.
+//!
 //! ## Modes
 //!
 //! **Fresh student** (random weights, architecture from size preset):
@@ -31,7 +41,6 @@
 //! {"prompt": "...", "completion": "..."}
 //! ```
 
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,11 +52,11 @@ use tracing::info;
 use xandllm_core::Tokenizer;
 use xandllm_distill::{
     dataset::DataLoader,
-    distiller::{DistillConfig, Distiller},
+    distiller::{DistillConfig, Phase1Runner, Phase2Runner},
     export::{export, OutputFormat},
     presets::SizePreset,
     student::TrainableStudent,
-    teacher::Teacher,
+    teacher::{estimate_model_size_mb, query_free_vram_mb, Teacher},
 };
 use xandllm_hub::{ModelCache, ModelDownloader};
 
@@ -91,8 +100,9 @@ pub async fn run(
     let cache_dir = expand_cache_dir(&config.model.cache_dir);
     let max_seq = max_seq_len.unwrap_or(config.inference.max_sequence_length);
     let cuda_id = config.device.cuda_device_id;
+    let use_gpu = prefer_gpu || config.device.prefer_gpu;
 
-    // ── Resolve dataset path (fall back to ./internal/dataset/) ──────────────
+    // ── Resolve dataset path ──────────────────────────────────────────────────
     let dataset_path: PathBuf = match dataset {
         Some(p) => p.clone(),
         None => {
@@ -118,64 +128,7 @@ pub async fn run(
         .with_context(|| format!("Failed to load dataset from {}", dataset_path.display()))?;
     info!(examples = loader.len(), "Dataset ready");
 
-    // ── Load teacher ──────────────────────────────────────────────────────────
-    let teacher = Teacher::load(
-        model_from,
-        &cache_dir,
-        prefer_gpu || config.device.prefer_gpu,
-        cuda_id,
-        config.inference.max_sequence_length,
-    )?;
-
-    let tokenizer = teacher.tokenizer();
-    let vocab_size = teacher.vocab_size();
-    let teacher_model_dir = model_dir_for(model_from, &cache_dir)?;
-
-    // ── Build student ─────────────────────────────────────────────────────────
-    let device = xandllm_core::select_device(
-        prefer_gpu || config.device.prefer_gpu,
-        cuda_id,
-    )?;
-
-    // Try building the student on the requested device.
-    // Candle can surface CUDA out-of-memory in two ways depending on version:
-    //   a) as a panic (.unwrap() inside candle-transformers) — caught by catch_unwind
-    //   b) as an Err propagated through ? — caught by checking the error message
-    // Both cases fall back to CPU automatically.
-    let student: TrainableStudent = {
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            build_student(size, student_base, vocab_size, tokenizer.clone(), &device, &cache_dir)
-        }));
-
-        match result {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let msg = format!("{e:?}");
-                if msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || msg.contains("out of memory") {
-                    eprintln!(
-                        "\n[WARN] CUDA out of memory building student model.\
-                         \n       Falling back to CPU (system RAM). Training will be slower\
-                         \n       but will complete successfully.\n"
-                    );
-                    let cpu = Device::Cpu;
-                    build_student(size, student_base, vocab_size, tokenizer.clone(), &cpu, &cache_dir)?
-                } else {
-                    return Err(e);
-                }
-            }
-            Err(_) => {
-                eprintln!(
-                    "\n[WARN] CUDA out of memory building student model.\
-                     \n       Falling back to CPU (system RAM). Training will be slower\
-                     \n       but will complete successfully.\n"
-                );
-                let cpu = Device::Cpu;
-                build_student(size, student_base, vocab_size, tokenizer.clone(), &cpu, &cache_dir)?
-            }
-        }
-    };
-
-    // ── Configure and run distiller ───────────────────────────────────────────
+    // ── Build distill config ──────────────────────────────────────────────────
     let distill_config = DistillConfig {
         epochs,
         batch_size,
@@ -184,10 +137,38 @@ pub async fn run(
         teacher_max_tokens: teacher_max_tokens.unwrap_or(512),
     };
 
-    let mut distiller = Distiller::new(teacher, student, distill_config, model_to.clone());
+    // ── PHASE 1: Teacher inference ────────────────────────────────────────────
+    //
+    // Load the teacher (GPU if VRAM allows), generate all completions, then
+    // DROP the teacher so VRAM is fully available for the student in Phase 2.
 
-    info!("Starting distillation");
-    let stats = distiller.run(&loader)?;
+    info!("=== Phase 1: Teacher inference ===");
+    let teacher = Teacher::load(model_from, &cache_dir, use_gpu, cuda_id, max_seq)?;
+    let teacher_model_dir = model_dir_for(model_from, &cache_dir)?;
+    let vocab_size = teacher.vocab_size();
+
+    let phase1 = Phase1Runner::new(teacher, distill_config.clone(), model_to.clone());
+    // `run` consumes `phase1` — the teacher is dropped at the end of this call.
+    let (teacher_data, tokenizer) = phase1.run(&loader)?;
+
+    // ── PHASE 2: Student training ─────────────────────────────────────────────
+    //
+    // Teacher has been dropped.  Decide student device based on current free VRAM.
+
+    info!("=== Phase 2: Student training ===");
+    let student_device = choose_student_device(use_gpu, cuda_id, size, student_base, &cache_dir)?;
+
+    let student = build_student(
+        size,
+        student_base,
+        vocab_size,
+        Arc::clone(&tokenizer),
+        &student_device,
+        &cache_dir,
+    )?;
+
+    let phase2 = Phase2Runner::new(student, distill_config);
+    let (stats, trained_student) = phase2.run(&teacher_data, Arc::clone(&tokenizer))?;
 
     info!(
         steps   = stats.total_steps,
@@ -198,8 +179,6 @@ pub async fn run(
     );
 
     // ── Export ────────────────────────────────────────────────────────────────
-    let trained_student = distiller.into_student();
-
     info!(format = ?output_format, output = %model_to.display(), "Exporting model");
     export(
         &trained_student,
@@ -227,28 +206,119 @@ pub async fn run(
     Ok(())
 }
 
+// ── Student device selection ──────────────────────────────────────────────────
+
+/// Proactively decide which device to use for the student, based on a VRAM
+/// estimate.  No surprise OOM panics — either we know it fits and use GPU, or
+/// we pick CPU upfront.
+///
+/// Strategy:
+/// - Estimate the student's full training memory footprint (weights + grads +
+///   AdamW first & second moments ≈ 4× weight size).
+/// - Compare against current free VRAM (teacher has already been dropped).
+/// - If `training_est ≤ free_vram × 2` → try GPU (covers cases where the
+///   estimate is conservative, e.g. 1 B on a 16 GB card).
+/// - Otherwise → CPU, no point attempting GPU.
+fn choose_student_device(
+    use_gpu: bool,
+    cuda_id: usize,
+    size: Option<&str>,
+    student_base: Option<&str>,
+    cache_dir: &Path,
+) -> Result<Device> {
+    if !use_gpu {
+        info!("Student: GPU not requested — using CPU");
+        return Ok(Device::Cpu);
+    }
+
+    // Get a CUDA device; if CUDA feature is off this returns CPU.
+    let gpu_device = xandllm_core::select_device(true, cuda_id)?;
+    if matches!(gpu_device, Device::Cpu) {
+        return Ok(Device::Cpu);
+    }
+
+    let free_mb = match query_free_vram_mb() {
+        Some(v) => v,
+        None => {
+            info!("Student: cannot query VRAM — loading on GPU optimistically");
+            return Ok(gpu_device);
+        }
+    };
+
+    let training_est_mb = estimate_student_training_mb(size, student_base, cache_dir);
+
+    // If the training footprint is within 2× of available VRAM it is worth
+    // trying GPU.  The factor-of-2 tolerance handles cases where our estimate
+    // is conservative (quantisation, GQA, etc.) and lets 1B models attempt
+    // 16 GB cards.  A genuine OOM will not occur in practice because the
+    // threshold is generous.
+    let try_gpu = training_est_mb <= free_mb.saturating_mul(2);
+
+    if try_gpu {
+        info!(
+            free_vram_mb = free_mb,
+            training_est_mb,
+            "Student: fits on GPU — using GPU"
+        );
+        Ok(gpu_device)
+    } else {
+        info!(
+            free_vram_mb = free_mb,
+            training_est_mb,
+            "Student: too large for GPU — using CPU (system RAM)"
+        );
+        Ok(Device::Cpu)
+    }
+}
+
+/// Estimate the full training memory footprint of the student in MiB.
+///
+/// Training = weights + gradients + AdamW first moment + AdamW second moment
+///          ≈ 4 × weight size (all in F32).
+///
+/// For `--size` presets the weight size comes from the known parameter counts.
+/// For `--student-base` fine-tunes we read the safetensors files off disk.
+fn estimate_student_training_mb(
+    size: Option<&str>,
+    student_base: Option<&str>,
+    cache_dir: &Path,
+) -> u64 {
+    // AdamW training uses 4× the weight memory (weights + grad + m1 + m2).
+    const ADAMW_FACTOR: u64 = 4;
+
+    let weights_mb: u64 = if let Some(preset_str) = size {
+        match preset_str.to_lowercase().as_str() {
+            "1b" => 4_400,   // ~1.1 B params × 4 bytes
+            "3b" => 12_288,  // ~3.0 B params × 4 bytes
+            "7b" => 28_000,  // ~7.0 B params × 4 bytes
+            _    => 8_192,   // safe default
+        }
+    } else if let Some(base_id) = student_base {
+        // Parse base_id into repo path and read disk size.
+        let (repo_id, _) = parse_model_id(base_id);
+        if let Ok(cache) = ModelCache::new(cache_dir) {
+            let base_dir = cache.model_dir(repo_id, "main");
+            estimate_model_size_mb(&base_dir)
+        } else {
+            8_192
+        }
+    } else {
+        8_192
+    };
+
+    weights_mb * ADAMW_FACTOR
+}
+
 // ── Auto-download helper ──────────────────────────────────────────────────────
 
 /// Ensure a model is present in the local cache.
-///
-/// If the model directory exists and already contains weight files (`.gguf` or
-/// `.safetensors`), nothing is done.  Otherwise the model is downloaded from
-/// Hugging Face Hub using the same logic as `xandllm pull`.
-///
-/// Accepts the same model-id formats as `pull`:
-/// - `owner/repo`                  — plain HF repo id
-/// - `owner/repo:Q4_0`             — GGUF with quantisation tag
-/// - `hf.co/owner/repo:Q4_0`       — Ollama-style prefix (stripped)
 async fn ensure_cached(raw_model_id: &str, cache_dir: &Path) -> Result<()> {
     let (repo_id, quant_tag) = parse_model_id(raw_model_id);
     let cache = ModelCache::new(cache_dir)?;
     let model_dir = cache.model_dir(repo_id, "main");
 
     if has_weight_files(&model_dir) {
-        info!(
-            model_id = repo_id,
-            "Model already cached — skipping download"
-        );
+        info!(model_id = repo_id, "Model already cached — skipping download");
         return Ok(());
     }
 
@@ -277,16 +347,10 @@ async fn ensure_cached(raw_model_id: &str, cache_dir: &Path) -> Result<()> {
             .with_context(|| format!("Download failed for '{repo_id}'"))?
     };
 
-    info!(
-        model_id = repo_id,
-        files = paths.len(),
-        "Model downloaded and cached"
-    );
+    info!(model_id = repo_id, files = paths.len(), "Model downloaded and cached");
     Ok(())
 }
 
-/// Return `true` if `dir` contains at least one `.gguf` file or a
-/// `model.safetensors` / `model.safetensors.index.json` file.
 fn has_weight_files(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
@@ -307,9 +371,8 @@ fn has_weight_files(dir: &Path) -> bool {
     false
 }
 
-// ── Model-ID parser (mirrors pull.rs) ────────────────────────────────────────
+// ── Model-ID parser ───────────────────────────────────────────────────────────
 
-/// Parse `[hf.co/]owner/repo[:quant_tag]` into `(repo_id, Option<quant_tag>)`.
 fn parse_model_id(raw: &str) -> (&str, Option<&str>) {
     let stripped = raw.strip_prefix("hf.co/").unwrap_or(raw);
     if let Some(colon) = stripped.rfind(':') {
@@ -330,10 +393,7 @@ fn model_dir_for(model_id: &str, cache_dir: &Path) -> Result<PathBuf> {
     Ok(cache.model_dir(repo_id, "main"))
 }
 
-/// Construct the student on `device`.
-///
-/// Called from within `catch_unwind` so it must not borrow non-`UnwindSafe`
-/// values directly — all inputs are cloned / owned before entry.
+/// Build a `TrainableStudent` on `device`.
 fn build_student(
     size: Option<&str>,
     student_base: Option<&str>,

@@ -37,6 +37,13 @@ pub struct SamplingParams {
     pub greedy: bool,
     /// Token ids that should stop generation.
     pub stop_token_ids: Vec<u32>,
+    /// Rolling window for repetition/frequency/presence penalties.
+    ///
+    /// Only the last `n` tokens are considered when computing penalties.
+    /// `None` means the full history is used (unbounded).  Set to a small
+    /// value (e.g. 64) to cap O(T) penalty scans on long sequences —
+    /// this is the `repeat_last_n` parameter from llama.cpp.
+    pub repeat_last_n: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -52,6 +59,9 @@ impl Default for SamplingParams {
             seed: None,
             greedy: false,
             stop_token_ids: vec![],
+            // Default 64: matches llama.cpp's repeat_last_n default.
+            // Bounds penalty cost to O(64) regardless of sequence length.
+            repeat_last_n: Some(64),
         }
     }
 }
