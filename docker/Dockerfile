@@ -36,6 +36,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ─── Stage 3: build dependencies (cached layer) ────────────────────────────────
 FROM chef AS builder
 
+# Tell candle-kernels / bindgen_cuda which SM to compile for.
+# This bypasses the nvidia-smi call that would otherwise fail during
+# docker build (GPU is not exposed to the build daemon by default).
+#
+# Override at build time:
+#   docker build --build-arg CUDA_COMPUTE_CAP=120 ...   # RTX 5060 Ti (Blackwell)
+#   docker build --build-arg CUDA_COMPUTE_CAP=89  ...   # RTX 4000 series (Ada)
+#   docker build --build-arg CUDA_COMPUTE_CAP=86  ...   # RTX 3000 series (Ampere)
+#
+# Default is 89 (Ada Lovelace). PTX from SM_89 runs on SM_120 (Blackwell) via
+# NVIDIA's forward-compatibility JIT with no functional difference.
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
 COPY --from=planner /app/recipe.json recipe.json
 
 # Build only dependencies — this layer is cached unless Cargo.toml changes

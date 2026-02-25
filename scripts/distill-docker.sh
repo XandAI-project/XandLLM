@@ -110,6 +110,22 @@ if ! docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
     echo "    sudo systemctl restart docker"
 fi
 
+# ── Detect GPU compute capability ────────────────────────────────────────────
+# candle-kernels needs to know which SM version to compile PTX for.
+# docker build has no GPU access, so we detect it from the host and pass it
+# as a --build-arg, bypassing the nvidia-smi call inside the container.
+#
+# Conversion: "12.0" → "120",  "8.9" → "89",  "8.6" → "86"
+COMPUTE_CAP="89"  # safe default (Ada Lovelace — runs on Blackwell via JIT)
+if command -v nvidia-smi &>/dev/null; then
+    RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+          | head -1 | tr -d ' \t\r' | tr -d '.')
+    if [[ "$RAW" =~ ^[0-9]+$ ]]; then
+        COMPUTE_CAP="$RAW"
+    fi
+fi
+echo "[INFO] GPU compute capability: SM_$COMPUTE_CAP"
+
 # ── Build image ───────────────────────────────────────────────────────────────
 cd "$WORKSPACE_ROOT"
 
@@ -137,6 +153,7 @@ if $REBUILD || ! docker image inspect xandllm:latest &>/dev/null; then
 
     docker build \
         --network host \
+        --build-arg CUDA_COMPUTE_CAP="$COMPUTE_CAP" \
         -f docker/Dockerfile \
         -t xandllm:latest \
         "$WORKSPACE_ROOT"
