@@ -116,7 +116,7 @@ fi
 # as a --build-arg, bypassing the nvidia-smi call inside the container.
 #
 # Conversion: "12.0" → "120",  "8.9" → "89",  "8.6" → "86"
-COMPUTE_CAP="89"  # safe default (Ada Lovelace — runs on Blackwell via JIT)
+COMPUTE_CAP="89"  # safe default (Ada Lovelace)
 if command -v nvidia-smi &>/dev/null; then
     RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
           | head -1 | tr -d ' \t\r' | tr -d '.')
@@ -124,7 +124,16 @@ if command -v nvidia-smi &>/dev/null; then
         COMPUTE_CAP="$RAW"
     fi
 fi
-echo "[INFO] GPU compute capability: SM_$COMPUTE_CAP"
+
+# bindgen_cuda 0.1.6 (candle-kernels 0.8.4) has a hardcoded arch list that
+# tops out at SM_90. Blackwell cards (RTX 5000 series) report SM_120.
+# Clamp to 89 so nvcc doesn't abort — SM_89 PTX runs on SM_120 via NVIDIA's
+# JIT forward compatibility with no functional difference.
+if [[ "$COMPUTE_CAP" -ge 100 ]]; then
+    echo "[INFO] SM_$COMPUTE_CAP detected (Blackwell) — clamping to SM_89 for candle-kernels 0.8.4 compatibility"
+    COMPUTE_CAP="89"
+fi
+echo "[INFO] Building with CUDA_COMPUTE_CAP=$COMPUTE_CAP"
 
 # ── Build image ───────────────────────────────────────────────────────────────
 cd "$WORKSPACE_ROOT"
