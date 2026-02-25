@@ -17,6 +17,7 @@ xandllm-core    = { path = "../xandllm-core" }
 xandllm-hub     = { path = "../xandllm-hub" }
 xandllm-api     = { path = "../xandllm-api" }
 xandllm-distill = { path = "../xandllm-distill" }
+candle-core     = { workspace = true }
 clap.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

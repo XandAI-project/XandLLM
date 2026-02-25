@@ -31,12 +31,16 @@
 //! {"prompt": "...", "completion": "..."}
 //! ```
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use candle_core::Device;
 use indicatif::MultiProgress;
 use tracing::info;
 
+use xandllm_core::Tokenizer;
 use xandllm_distill::{
     dataset::DataLoader,
     distiller::{DistillConfig, Distiller},
@@ -133,15 +137,27 @@ pub async fn run(
         cuda_id,
     )?;
 
-    let student: TrainableStudent = if let Some(preset_str) = size {
-        let preset = SizePreset::parse(preset_str)?;
-        info!(preset = preset.label(), vocab_size, "Building student from size preset");
-        TrainableStudent::from_preset(&preset, vocab_size, tokenizer.clone(), &device)?
-    } else {
-        let base_id = student_base.unwrap(); // validated above
-        info!(base = base_id, "Loading student base model for fine-tuning");
-        let base_dir = model_dir_for(base_id, &cache_dir)?;
-        TrainableStudent::from_safetensors(&base_dir, tokenizer.clone(), &device)?
+    // Try building the student on the requested device. Candle surfaces CUDA
+    // out-of-memory as a panic (`.unwrap()` inside candle-transformers), so we
+    // catch it with `catch_unwind` and automatically retry on CPU.
+    let student: TrainableStudent = {
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            build_student(size, student_base, vocab_size, tokenizer.clone(), &device, &cache_dir)
+        }));
+
+        match result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                eprintln!(
+                    "\n[WARN] CUDA out of memory building student model.\
+                     \n       Falling back to CPU (system RAM). Training will be slower\
+                     \n       but will complete successfully with your 64 GB RAM.\n"
+                );
+                let cpu = Device::Cpu;
+                build_student(size, student_base, vocab_size, tokenizer.clone(), &cpu, &cache_dir)?
+            }
+        }
     };
 
     // ── Configure and run distiller ───────────────────────────────────────────
@@ -291,10 +307,34 @@ fn parse_model_id(raw: &str) -> (&str, Option<&str>) {
     (stripped, None)
 }
 
-// ── Small utility ─────────────────────────────────────────────────────────────
+// ── Small utilities ───────────────────────────────────────────────────────────
 
 fn model_dir_for(model_id: &str, cache_dir: &Path) -> Result<PathBuf> {
     let (repo_id, _) = parse_model_id(model_id);
     let cache = ModelCache::new(cache_dir)?;
     Ok(cache.model_dir(repo_id, "main"))
+}
+
+/// Construct the student on `device`.
+///
+/// Called from within `catch_unwind` so it must not borrow non-`UnwindSafe`
+/// values directly — all inputs are cloned / owned before entry.
+fn build_student(
+    size: Option<&str>,
+    student_base: Option<&str>,
+    vocab_size: usize,
+    tokenizer: Arc<Tokenizer>,
+    device: &Device,
+    cache_dir: &Path,
+) -> Result<TrainableStudent> {
+    if let Some(preset_str) = size {
+        let preset = SizePreset::parse(preset_str)?;
+        info!(preset = preset.label(), vocab_size, "Building student from size preset");
+        TrainableStudent::from_preset(&preset, vocab_size, tokenizer, device)
+    } else {
+        let base_id = student_base.expect("validated: --size or --student-base required");
+        info!(base = base_id, "Loading student base model for fine-tuning");
+        let base_dir = model_dir_for(base_id, cache_dir)?;
+        TrainableStudent::from_safetensors(&base_dir, tokenizer, device)
+    }
 }

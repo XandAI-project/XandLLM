@@ -209,6 +209,10 @@ if $GPU; then
     GPU_FLAGS="--gpus all"
 fi
 
+# Store model cache on the data drive (bind-mount) rather than a Docker named
+# volume, which would land on the slower/smaller system drive.
+mkdir -p "$WORKSPACE_ROOT/models"
+
 docker run --rm \
     $GPU_FLAGS \
     -e DISTILL_MODEL_FROM \
@@ -223,7 +227,7 @@ docker run --rm \
     -e DISTILL_TYPE \
     -e RUST_LOG="${RUST_LOG:-info}" \
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
-    -v xandllm_model-cache:/root/.cache/xandllm \
+    -v "$WORKSPACE_ROOT/models:/root/.cache/xandllm" \
     -v "$WORKSPACE_ROOT/internal/dataset:/app/internal/dataset:ro" \
     -v "$OUTPUT_HOST:/app/output/$(basename "$OUTPUT_HOST")" \
     $EXTRA_VOLUMES \

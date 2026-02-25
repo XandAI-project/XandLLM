@@ -9,9 +9,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::info;
 
+use candle_core::Device;
 use xandllm_core::{
     chat_template,
-    select_device,
     AnyModel,
     GenerateInput,
     Model,
@@ -56,7 +56,11 @@ impl Teacher {
             "Loading teacher model"
         );
 
-        let device = select_device(prefer_gpu, cuda_device_id)?;
+        // Teacher only runs forward inference — it never receives gradients.
+        // Keeping it on CPU frees the full GPU memory budget for student training.
+        // The 64 GB RAM easily holds even a 7B Q4_0 GGUF (~4.3 GB).
+        let _ = (prefer_gpu, cuda_device_id); // params kept for API compatibility
+        let device = Device::Cpu;
 
         let model_config = ModelConfig {
             repo_id: model_id.to_string(),
