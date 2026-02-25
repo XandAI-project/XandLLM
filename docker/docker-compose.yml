@@ -1,6 +1,6 @@
 services:
 
-  # ── Main inference server ───────────────────────────────────────────────────
+  # ── Main inference server ────────────────────────────────────────────────────
   xandllm:
     build:
       context: ..
@@ -14,18 +14,17 @@ services:
       - ../config:/app/config:ro
     environment:
       - RUST_LOG=${RUST_LOG:-info}
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
       - XANDLLM_SERVER_HOST=0.0.0.0
       - XANDLLM_SERVER_PORT=11435
     command: >
       sh -c "
-        xandllm pull bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
-          --revision main
-          --gguf-file Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+        xandllm pull ${MODEL_ID:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF}:Q4_0
         && xandllm serve
-          --model bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+          --model ${MODEL_ID:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF}
           --host 0.0.0.0
           --port 11435
+          --gpu
       "
     deploy:
       resources:
@@ -42,12 +41,90 @@ services:
       retries: 5
       start_period: 120s
 
-  # ── Integration tests ───────────────────────────────────────────────────────
+  # ── Knowledge distillation job ───────────────────────────────────────────────
+  #
+  # Runs a one-shot distillation and exits.  The model cache is shared with the
+  # xandllm service so already-downloaded models are reused.
+  #
+  # Usage (via helper script — recommended):
+  #   bash scripts/distill-docker.sh --name "Alfredo-3B" --size 3b
+  #
+  # Usage (direct docker compose):
+  #   docker compose -f docker/docker-compose.yml run --rm distill \
+  #     xandllm distill \
+  #       --model-from Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_0 \
+  #       --model-to   /app/output/Alfredo-3B \
+  #       --size       3b \
+  #       --gpu
+  #
+  # Environment variables (all optional — script sets them automatically):
+  #   DISTILL_MODEL_FROM   teacher model id  (default: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_0)
+  #   DISTILL_MODEL_TO     output path       (default: /app/output/XandLM-Distilled)
+  #   DISTILL_SIZE         1b | 3b | 7b      (default: 3b; mutually exclusive with DISTILL_STUDENT_BASE)
+  #   DISTILL_STUDENT_BASE existing model to fine-tune (mutually exclusive with DISTILL_SIZE)
+  #   DISTILL_NAME         human-readable model name embedded in config.json
+  #   DISTILL_EPOCHS       (default: 3)
+  #   DISTILL_BATCH_SIZE   (default: 2)
+  #   DISTILL_LR           learning rate    (default: 5e-5)
+  #   DISTILL_MAX_TOKENS   teacher max new tokens (default: 512)
+  #   DISTILL_TYPE         safetensor | gguf (default: safetensor)
+  distill:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: xandllm:latest
+    container_name: xandllm-distill
+    profiles: ["distill"]
+    volumes:
+      - model-cache:/root/.cache/xandllm
+      - ../internal/dataset:/app/internal/dataset:ro
+      - ../output:/app/output
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - DISTILL_MODEL_FROM=${DISTILL_MODEL_FROM:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_0}
+      - DISTILL_MODEL_TO=${DISTILL_MODEL_TO:-/app/output/XandLM-Distilled}
+      - DISTILL_SIZE=${DISTILL_SIZE:-}
+      - DISTILL_STUDENT_BASE=${DISTILL_STUDENT_BASE:-}
+      - DISTILL_NAME=${DISTILL_NAME:-}
+      - DISTILL_EPOCHS=${DISTILL_EPOCHS:-3}
+      - DISTILL_BATCH_SIZE=${DISTILL_BATCH_SIZE:-2}
+      - DISTILL_LR=${DISTILL_LR:-5e-5}
+      - DISTILL_MAX_TOKENS=${DISTILL_MAX_TOKENS:-512}
+      - DISTILL_TYPE=${DISTILL_TYPE:-safetensor}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        ARGS="--model-from $DISTILL_MODEL_FROM"
+        ARGS="$ARGS --model-to $DISTILL_MODEL_TO"
+        ARGS="$ARGS --type $DISTILL_TYPE"
+        ARGS="$ARGS --epochs $DISTILL_EPOCHS"
+        ARGS="$ARGS --batch-size $DISTILL_BATCH_SIZE"
+        ARGS="$ARGS --learning-rate $DISTILL_LR"
+        ARGS="$ARGS --teacher-max-tokens $DISTILL_MAX_TOKENS"
+        ARGS="$ARGS --gpu"
+        [ -n "$DISTILL_SIZE" ]         && ARGS="$ARGS --size $DISTILL_SIZE"
+        [ -n "$DISTILL_STUDENT_BASE" ] && ARGS="$ARGS --student-base $DISTILL_STUDENT_BASE"
+        [ -n "$DISTILL_NAME" ]         && ARGS="$ARGS --name $DISTILL_NAME"
+        echo "==> xandllm distill $ARGS"
+        exec xandllm distill $ARGS
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+  # ── Integration tests ────────────────────────────────────────────────────────
   # Runs once after the server is healthy; exits 0 on success, 1 on failure.
   # Run with:  docker compose up --exit-code-from xandllm-test
   xandllm-test:
     image: alpine/curl:latest
     container_name: xandllm-test
+    profiles: ["test"]
     depends_on:
       xandllm:
         condition: service_healthy
@@ -55,11 +132,11 @@ services:
       - ./integration_test.sh:/integration_test.sh:ro
     environment:
       - API_URL=http://xandllm:11435
-      - TEST_MODEL_ID=bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+      - TEST_MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF}
     command: ["/bin/sh", "/integration_test.sh"]
     restart: "no"
 
-  # ── Frontend UI ─────────────────────────────────────────────────────────────
+  # ── Frontend UI ──────────────────────────────────────────────────────────────
   frontend:
     build:
       context: ../frontend

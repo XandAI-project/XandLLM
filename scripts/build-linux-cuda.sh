@@ -3,10 +3,13 @@
 #
 # Requirements:
 #   - CUDA 12.x toolkit  (nvcc on PATH, or CUDA_PATH set)
+#     NOTE: CUDA 13.0 is NOT yet supported by the underlying cudarc crate.
+#           If only CUDA 13.0 is installed this script will try to locate a
+#           parallel CUDA 12.x installation, and print installation instructions
+#           if none is found.
 #   - Rust 1.76+
 #
-# Usage: bash scripts/build-linux-cuda.sh [cuda_version]
-#   cuda_version  Optional CUDA version suffix, e.g. "12.6" (default: auto-detect)
+# Usage: bash scripts/build-linux-cuda.sh
 
 set -euo pipefail
 
@@ -26,32 +29,114 @@ fi
 
 echo "[INFO] Rust version: $(rustc --version)"
 
-# Verify CUDA toolkit
-if ! command -v nvcc &>/dev/null; then
-    # Try common CUDA paths
-    for candidate in /usr/local/cuda/bin /usr/local/cuda-12*/bin /opt/cuda/bin; do
-        if [ -x "$candidate/nvcc" ]; then
-            export PATH="$candidate:$PATH"
-            break
+# ── Find a usable CUDA 12.x installation ──────────────────────────────────────
+
+find_cuda12() {
+    # Priority list of known CUDA 12.x paths (newest first)
+    local candidates=(
+        /usr/local/cuda-12.8/bin
+        /usr/local/cuda-12.6/bin
+        /usr/local/cuda-12.5/bin
+        /usr/local/cuda-12.4/bin
+        /usr/local/cuda-12.3/bin
+        /usr/local/cuda-12.2/bin
+        /usr/local/cuda-12.1/bin
+        /usr/local/cuda-12.0/bin
+        /opt/cuda-12.8/bin
+        /opt/cuda-12.6/bin
+        /opt/cuda-12.4/bin
+        /opt/cuda/bin
+    )
+    for dir in "${candidates[@]}"; do
+        if [[ -x "$dir/nvcc" ]]; then
+            local ver
+            ver=$("$dir/nvcc" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || true)
+            if [[ "$ver" == 12.* ]]; then
+                echo "$dir"
+                return 0
+            fi
         fi
     done
+    # Also scan /usr/local/cuda-12.*/bin dynamically
+    for dir in /usr/local/cuda-12.*/bin; do
+        if [[ -x "$dir/nvcc" ]]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolve nvcc — prefer what's already on PATH
+NVCC_BIN=""
+if command -v nvcc &>/dev/null; then
+    NVCC_BIN="$(command -v nvcc)"
 fi
 
-if ! command -v nvcc &>/dev/null; then
-    echo "[ERROR] nvcc not found. Install the CUDA 12.x toolkit from:"
-    echo "        https://developer.nvidia.com/cuda-downloads"
-    echo ""
-    echo "  Alternatively build without GPU support:"
-    echo "    bash scripts/build-linux.sh"
-    exit 1
+if [[ -n "$NVCC_BIN" ]]; then
+    NVCC_VERSION=$("$NVCC_BIN" --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+    echo "[INFO] Found nvcc $NVCC_VERSION at $NVCC_BIN"
+
+    # CUDA 13.x is not yet supported by the cudarc crate used by candle.
+    if [[ "$NVCC_VERSION" == 13.* ]]; then
+        echo ""
+        echo "[WARN] CUDA $NVCC_VERSION detected — cudarc (the Rust CUDA binding)"
+        echo "       does not yet support CUDA 13.x. Searching for a CUDA 12.x"
+        echo "       installation to use instead..."
+        echo ""
+
+        CUDA12_BIN=$(find_cuda12 || true)
+        if [[ -n "$CUDA12_BIN" ]]; then
+            NVCC_BIN="$CUDA12_BIN/nvcc"
+            NVCC_VERSION=$("$NVCC_BIN" --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+            export PATH="$CUDA12_BIN:$PATH"
+            export CUDA_PATH="$(dirname "$CUDA12_BIN")"
+            echo "[INFO] Using CUDA $NVCC_VERSION at $CUDA12_BIN"
+        else
+            echo "[ERROR] No CUDA 12.x installation found."
+            echo ""
+            echo "  The cudarc crate (used by candle) does not yet support CUDA 13.0."
+            echo "  Your RTX 5060 Ti (Blackwell) supports CUDA 12.4+, so you can install"
+            echo "  CUDA 12.x alongside CUDA 13.0:"
+            echo ""
+            echo "  Option 1 — Install CUDA 12.8 via apt (Ubuntu 22.04 / 24.04):"
+            echo "    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+            echo "    sudo dpkg -i cuda-keyring_1.1-1_all.deb"
+            echo "    sudo apt update"
+            echo "    sudo apt install -y cuda-toolkit-12-8"
+            echo ""
+            echo "  Option 2 — Install via the CUDA runfile (keeps both 12.x and 13.x):"
+            echo "    https://developer.nvidia.com/cuda-12-8-0-download-archive"
+            echo ""
+            echo "  After installing CUDA 12.x, re-run this script."
+            echo "  (CUDA 13.0 support in cudarc is tracked upstream:"
+            echo "   https://github.com/huggingface/candle/issues/3087)"
+            exit 1
+        fi
+    fi
+else
+    # nvcc not on PATH — search common locations for any 12.x install
+    CUDA12_BIN=$(find_cuda12 || true)
+    if [[ -n "$CUDA12_BIN" ]]; then
+        export PATH="$CUDA12_BIN:$PATH"
+        export CUDA_PATH="$(dirname "$CUDA12_BIN")"
+        NVCC_VERSION=$("$CUDA12_BIN/nvcc" --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+        echo "[INFO] Found CUDA $NVCC_VERSION at $CUDA12_BIN"
+    else
+        echo "[ERROR] nvcc not found and no CUDA 12.x installation located."
+        echo ""
+        echo "  Install CUDA 12.x from:"
+        echo "    https://developer.nvidia.com/cuda-12-8-0-download-archive"
+        echo ""
+        echo "  Or build without GPU support:"
+        echo "    bash scripts/build-linux.sh"
+        exit 1
+    fi
 fi
 
-NVCC_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
-echo "[INFO] CUDA toolkit: nvcc $NVCC_VERSION"
-
-# Export canonical CUDA_PATH if not already set
-if [ -z "${CUDA_PATH:-}" ]; then
-    CUDA_PATH="$(dirname "$(dirname "$(command -v nvcc)")")"
+# Set CUDA_PATH from the resolved nvcc if not already set
+if [[ -z "${CUDA_PATH:-}" ]]; then
+    CUDA_PATH="$(dirname "$(dirname "$NVCC_BIN")")"
     export CUDA_PATH
 fi
 echo "[INFO] CUDA_PATH: $CUDA_PATH"
@@ -69,7 +154,7 @@ echo ""
 
 cd "$WORKSPACE_ROOT"
 
-echo "[BUILD] Compiling xandllm with CUDA support ..."
+echo "[BUILD] Compiling xandllm with CUDA $NVCC_VERSION support ..."
 echo "        (First build may take 5–15 minutes — CUDA kernels compile from source)"
 echo ""
 
@@ -77,8 +162,8 @@ cargo install --path crates/xandllm-cli --features cuda --locked
 
 echo ""
 echo "======================================================"
-echo "  Build complete — CUDA enabled"
-echo "  Binary installed at: $(which xandllm 2>/dev/null || echo '~/.cargo/bin/xandllm')"
+echo "  Build complete — CUDA $NVCC_VERSION enabled"
+echo "  Binary: $(which xandllm 2>/dev/null || echo '~/.cargo/bin/xandllm')"
 echo ""
 echo "  Quick start:"
 echo "    xandllm pull Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_0"

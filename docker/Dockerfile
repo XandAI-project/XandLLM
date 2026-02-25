@@ -1,5 +1,10 @@
-# ─── Stage 1: dependency planner (cargo-chef) ─────────────────────────────────
-FROM nvidia/cuda:12.3.0-devel-ubuntu22.04 AS chef
+# ─── Stage 1: dependency planner (cargo-chef) ──────────────────────────────────
+#
+# Uses CUDA 12.6 — the host driver version does not need to match;
+# the NVIDIA Container Toolkit (nvidia-docker2) maps any host driver ≥ 12.6
+# to this runtime.  This lets the image build and run on hosts with CUDA 13.x
+# (e.g. RTX 5000 Blackwell cards) without any host-side changes.
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS chef
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,13 +26,13 @@ RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
-# ─── Stage 2: compute the recipe (dependency manifest) ────────────────────────
+# ─── Stage 2: compute the recipe (dependency manifest) ─────────────────────────
 FROM chef AS planner
 
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ─── Stage 3: build dependencies (cached layer) ───────────────────────────────
+# ─── Stage 3: build dependencies (cached layer) ────────────────────────────────
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
@@ -39,30 +44,29 @@ RUN cargo chef cook --release --features cuda --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --features cuda --bin xandllm
 
-# ─── Stage 4: slim runtime image ──────────────────────────────────────────────
-FROM nvidia/cuda:12.3.0-runtime-ubuntu22.04 AS runtime
+# ─── Stage 4: slim runtime image ───────────────────────────────────────────────
+FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from the builder stage
 COPY --from=builder /app/target/release/xandllm /usr/local/bin/xandllm
 
-# Copy default config
-COPY config/ /app/config/
+# Copy default config and internal dataset (for distillation default fallback)
+COPY config/            /app/config/
+COPY internal/dataset/  /app/internal/dataset/
 
 WORKDIR /app
 
-# Default model cache directory
-RUN mkdir -p /root/.cache/xandllm
+RUN mkdir -p /root/.cache/xandllm /app/output
 
 EXPOSE 11435
 
 ENTRYPOINT ["xandllm"]
-# Default: serve LLaMA 3.1 8B Instruct Q4_K_M (GGUF quantized).
-# Override MODEL_ID via docker run -e MODEL_ID=... or docker-compose environment.
 CMD ["serve", "--model", "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"]
