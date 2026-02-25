@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::info;
 
 use candle_core::Device;
 use xandllm_core::{

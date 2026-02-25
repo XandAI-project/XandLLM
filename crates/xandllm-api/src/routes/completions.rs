@@ -92,6 +92,7 @@ pub async fn create_completion(
         seed: req.seed,
         greedy: false,
         stop_token_ids,
+        repeat_last_n: Some(64),
     };
 
     let token_ids = tokenizer
