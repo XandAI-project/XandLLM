@@ -32,8 +32,10 @@ pub struct Teacher {
 impl Teacher {
     /// Load a teacher from the local model cache.
     ///
-    /// `model_id` can be any format accepted by [`ModelCache`] (HF repo id or
-    /// a path to a directory that already contains model weights).
+    /// `model_id` accepts the same formats as `xandllm pull`:
+    /// - `owner/repo`
+    /// - `owner/repo:Q4_0`  (quant tag is stripped before building the cache path)
+    /// - `hf.co/owner/repo:Q4_0`
     pub fn load(
         model_id: &str,
         cache_dir: &Path,
@@ -41,8 +43,12 @@ impl Teacher {
         cuda_device_id: usize,
         max_sequence_length: usize,
     ) -> Result<Self> {
+        // Strip optional quant tag (e.g. "repo:Q4_0" → "repo") before building
+        // the cache path — the tag is never part of the on-disk directory name.
+        let repo_id = strip_quant_tag(model_id);
+
         let cache = ModelCache::new(cache_dir)?;
-        let model_dir = cache.model_dir(model_id, "main");
+        let model_dir = cache.model_dir(repo_id, "main");
 
         info!(
             model_id,
@@ -142,4 +148,23 @@ impl Teacher {
 
         Ok(output)
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Strip an optional quantisation tag from a model id.
+///
+/// `"owner/repo:Q4_0"` → `"owner/repo"`
+/// `"owner/repo"`      → `"owner/repo"` (unchanged)
+/// `"hf.co/owner/repo:Q4_0"` → `"owner/repo"`
+fn strip_quant_tag(model_id: &str) -> &str {
+    let s = model_id.strip_prefix("hf.co/").unwrap_or(model_id);
+    if let Some(colon) = s.rfind(':') {
+        let tag = &s[colon + 1..];
+        // Only treat as quant tag if there are no path separators after ':'
+        if !tag.is_empty() && !tag.contains('/') && !tag.contains('\\') {
+            return &s[..colon];
+        }
+    }
+    s
 }
