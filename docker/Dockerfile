@@ -17,12 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+# Install Rust + cargo-chef in one layer.
+# Using the absolute path for the first cargo invocation avoids PATH
+# sourcing issues that occur when the CUDA base image reinitialises PATH
+# between RUN steps.
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable \
+    && /root/.cargo/bin/cargo install cargo-chef --locked
 ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Install cargo-chef for layer-cached builds
-RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
