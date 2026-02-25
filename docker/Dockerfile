@@ -8,13 +8,14 @@ FROM nvcr.io/nvidia/cuda:12.6.2-devel-ubuntu22.04 AS chef
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    build-essential \
-    clang \
+RUN for i in 1 2 3; do apt-get update && break || (echo "[apt] retry $i/3..." && sleep 10); done \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+        build-essential \
+        clang \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust + cargo-chef in one layer.
@@ -64,10 +65,11 @@ FROM nvcr.io/nvidia/cuda:12.6.2-runtime-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
-    ca-certificates \
-    curl \
+RUN for i in 1 2 3; do apt-get update && break || (echo "[apt] retry $i/3..." && sleep 10); done \
+    && apt-get install -y --no-install-recommends \
+        libssl3 \
+        ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from the builder stage
