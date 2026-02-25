@@ -4,7 +4,7 @@
 # the NVIDIA Container Toolkit (nvidia-docker2) maps any host driver ≥ 12.6
 # to this runtime.  This lets the image build and run on hosts with CUDA 13.x
 # (e.g. RTX 5000 Blackwell cards) without any host-side changes.
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS chef
+FROM nvcr.io/nvidia/cuda:12.6.2-devel-ubuntu22.04 AS chef
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -45,7 +45,7 @@ COPY . .
 RUN cargo build --release --features cuda --bin xandllm
 
 # ─── Stage 4: slim runtime image ───────────────────────────────────────────────
-FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
+FROM nvcr.io/nvidia/cuda:12.6.2-runtime-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 

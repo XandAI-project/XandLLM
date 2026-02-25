@@ -114,9 +114,34 @@ fi
 cd "$WORKSPACE_ROOT"
 
 if $REBUILD || ! docker image inspect xandllm:latest &>/dev/null; then
-    echo "[BUILD] Building xandllm:latest (CUDA 12.6 inside the container) ..."
+    echo "[BUILD] Building xandllm:latest (CUDA 12.6 — nvcr.io registry) ..."
     echo "        (First build takes 5–15 minutes)"
-    docker build -f docker/Dockerfile -t xandllm:latest .
+    echo ""
+
+    # Use --network host to bypass Docker Hub TLS issues on some Linux setups.
+    # Pull the base image explicitly first with retries, then build.
+    for attempt in 1 2 3; do
+        echo "[BUILD] Pulling base image (attempt $attempt/3) ..."
+        if docker pull nvcr.io/nvidia/cuda:12.6.2-devel-ubuntu22.04; then
+            break
+        fi
+        if [[ $attempt -eq 3 ]]; then
+            echo "[ERROR] Could not pull the CUDA base image after 3 attempts."
+            echo "  Check your internet connection, then retry:"
+            echo "    bash scripts/distill-docker.sh --rebuild ..."
+            exit 1
+        fi
+        echo "[WARN] Pull failed — retrying in 5 s ..."
+        sleep 5
+    done
+
+    docker build \
+        --network host \
+        -f docker/Dockerfile \
+        -t xandllm:latest \
+        "$WORKSPACE_ROOT"
+
+    echo ""
     echo "[BUILD] Image ready."
     echo ""
 fi
