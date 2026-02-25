@@ -143,6 +143,7 @@ pub async fn run(
             seed,
             greedy: false,
             stop_token_ids: stop_token_ids.clone(),
+            repeat_last_n: Some(64),
         };
 
         // ── Stream the response ───────────────────────────────────────────

@@ -106,6 +106,7 @@ pub async fn run(
         seed,
         greedy: false,
         stop_token_ids,
+        repeat_last_n: Some(64),
     };
 
     info!("Generating response");
