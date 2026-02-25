@@ -137,9 +137,11 @@ pub async fn run(
         cuda_id,
     )?;
 
-    // Try building the student on the requested device. Candle surfaces CUDA
-    // out-of-memory as a panic (`.unwrap()` inside candle-transformers), so we
-    // catch it with `catch_unwind` and automatically retry on CPU.
+    // Try building the student on the requested device.
+    // Candle can surface CUDA out-of-memory in two ways depending on version:
+    //   a) as a panic (.unwrap() inside candle-transformers) — caught by catch_unwind
+    //   b) as an Err propagated through ? — caught by checking the error message
+    // Both cases fall back to CPU automatically.
     let student: TrainableStudent = {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             build_student(size, student_base, vocab_size, tokenizer.clone(), &device, &cache_dir)
@@ -147,12 +149,25 @@ pub async fn run(
 
         match result {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                let msg = format!("{e:?}");
+                if msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || msg.contains("out of memory") {
+                    eprintln!(
+                        "\n[WARN] CUDA out of memory building student model.\
+                         \n       Falling back to CPU (system RAM). Training will be slower\
+                         \n       but will complete successfully.\n"
+                    );
+                    let cpu = Device::Cpu;
+                    build_student(size, student_base, vocab_size, tokenizer.clone(), &cpu, &cache_dir)?
+                } else {
+                    return Err(e);
+                }
+            }
             Err(_) => {
                 eprintln!(
                     "\n[WARN] CUDA out of memory building student model.\
                      \n       Falling back to CPU (system RAM). Training will be slower\
-                     \n       but will complete successfully with your 64 GB RAM.\n"
+                     \n       but will complete successfully.\n"
                 );
                 let cpu = Device::Cpu;
                 build_student(size, student_base, vocab_size, tokenizer.clone(), &cpu, &cache_dir)?

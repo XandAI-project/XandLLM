@@ -182,12 +182,16 @@ fn choose_teacher_device(
     };
 
     let model_mb = estimate_model_size_mb(model_dir);
-    let needed_mb = model_mb + 1024; // 1 GB headroom for KV cache + runtime
+    // Require: model + 1 GB KV-cache headroom + 4 GB spare for student init/training.
+    // Without the spare, teacher fills VRAM and student construction OOMs even
+    // though the error looks unrelated.
+    let needed_mb = model_mb + 1024 + 4096;
 
     if free_mb >= needed_mb {
         info!(
             free_vram_mb = free_mb,
             model_mb,
+            needed_mb,
             "Teacher: enough VRAM — loading on GPU"
         );
         Ok(device)
