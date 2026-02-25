@@ -4,8 +4,9 @@
 //!
 //! **Phase 1** — Teacher generation
 //! For every prompt in the dataset the teacher model generates a completion.
-//! Results are saved to an intermediate JSONL file in the output directory so
-//! the (expensive) teacher pass can be skipped if it already ran.
+//! Results are saved incrementally to an intermediate JSONL file in the output
+//! directory.  If the process is interrupted, the next run resumes from where
+//! it left off.
 //!
 //! **Phase 2** — Student training
 //! The student model is trained with cross-entropy loss to predict the
@@ -110,8 +111,8 @@ impl Distiller {
 
     /// Run the full distillation pipeline.
     ///
-    /// 1. Generate teacher completions for every prompt (or reuse a previous
-    ///    run's `teacher_outputs.jsonl` if it already exists).
+    /// 1. Generate teacher completions for every prompt (or reuse / resume a
+    ///    previous run's `teacher_outputs.jsonl`).
     /// 2. Train the student.
     pub fn run(&mut self, dataset: &DataLoader) -> Result<TrainingStats> {
         std::fs::create_dir_all(&self.output_dir)
@@ -119,23 +120,7 @@ impl Distiller {
 
         let teacher_cache = self.output_dir.join("teacher_outputs.jsonl");
 
-        let teacher_data: Vec<DataPoint> = if teacher_cache.exists() {
-            info!(
-                path = %teacher_cache.display(),
-                "Reusing existing teacher_outputs.jsonl (delete the file to regenerate)"
-            );
-            load_teacher_cache(&teacher_cache)?
-        } else {
-            info!(examples = dataset.len(), "Phase 1: generating teacher completions");
-            let data = self.generate_teacher_outputs(dataset)?;
-            save_teacher_cache(&teacher_cache, &data)?;
-            info!(
-                path = %teacher_cache.display(),
-                count = data.len(),
-                "Teacher outputs saved"
-            );
-            data
-        };
+        let teacher_data = self.generate_teacher_outputs_resumable(dataset, &teacher_cache)?;
 
         info!(
             examples = teacher_data.len(),
@@ -149,39 +134,133 @@ impl Distiller {
 
     // ── Phase 1 ───────────────────────────────────────────────────────────────
 
-    /// Run the teacher model over every prompt in `dataset` and return the
-    /// resulting `(prompt, completion)` pairs.
-    pub fn generate_teacher_outputs(&mut self, dataset: &DataLoader) -> Result<Vec<DataPoint>> {
-        let n = dataset.len();
-        let pb = progress_bar(n as u64, "Teacher generation");
+    /// Generate teacher completions, resuming from a partial cache file.
+    ///
+    /// Already-completed records are loaded from `cache_path`.  New records are
+    /// appended one-by-one so progress survives crashes.
+    fn generate_teacher_outputs_resumable(
+        &mut self,
+        dataset: &DataLoader,
+        cache_path: &Path,
+    ) -> Result<Vec<DataPoint>> {
+        let total = dataset.len();
         let chat_fmt = self.teacher.chat_format().to_string();
 
-        let mut results = Vec::with_capacity(n);
+        // Load any previously completed records.
+        let mut results: Vec<DataPoint> = if cache_path.exists() {
+            let existing = load_teacher_cache(cache_path)?;
+            if existing.len() >= total {
+                info!(
+                    path = %cache_path.display(),
+                    count = existing.len(),
+                    "Phase 1 already complete — reusing teacher_outputs.jsonl"
+                );
+                return Ok(existing);
+            }
+            info!(
+                path = %cache_path.display(),
+                completed = existing.len(),
+                remaining = total - existing.len(),
+                "Resuming Phase 1 from existing teacher_outputs.jsonl"
+            );
+            existing
+        } else {
+            Vec::with_capacity(total)
+        };
 
-        for dp in dataset.as_slice() {
-            // Format the prompt with the teacher's chat template so the
-            // teacher sees the proper instruction wrapper.
-            let formatted = chat_template::format_prompt(&chat_fmt, &dp.prompt, "You are a helpful assistant.");
+        let already_done = results.len();
+        let remaining = total - already_done;
 
-            let completion = match self.teacher.generate_completion(
+        if remaining == 0 {
+            return Ok(results);
+        }
+
+        info!(
+            total,
+            already_done,
+            remaining,
+            "Phase 1: generating teacher completions"
+        );
+
+        // Open the cache file in append mode for incremental writes.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_path)
+            .with_context(|| format!("Cannot open {} for appending", cache_path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        let pb = phase1_progress_bar(total as u64);
+        pb.set_position(already_done as u64);
+
+        let start = Instant::now();
+        let mut total_tokens: usize = 0;
+
+        for (i, dp) in dataset.as_slice().iter().enumerate() {
+            if i < already_done {
+                continue;
+            }
+
+            let formatted = chat_template::format_prompt(
+                &chat_fmt,
+                &dp.prompt,
+                "You are a helpful assistant.",
+            );
+
+            let (completion, gen_tokens) = match self.teacher.generate_completion(
                 &formatted,
                 self.config.teacher_max_tokens,
             ) {
-                Ok(c) => c,
+                Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, prompt = %dp.prompt, "Teacher generation failed; using original completion");
-                    dp.completion.clone()
+                    (dp.completion.clone(), 0)
                 }
             };
 
-            results.push(DataPoint {
-                prompt: formatted,
-                completion,
-            });
-            pb.inc(1);
+            total_tokens += gen_tokens;
+
+            // Append to cache immediately.
+            let rec = TeacherRecord {
+                prompt: formatted.clone(),
+                completion: completion.clone(),
+            };
+            let line = serde_json::to_string(&rec)?;
+            writeln!(writer, "{line}")?;
+            writer.flush()?;
+
+            results.push(DataPoint { prompt: formatted, completion });
+
+            // Update progress bar with tok/s and ETA.
+            let done = (i + 1 - already_done) as f64;
+            let elapsed = start.elapsed().as_secs_f64().max(0.001);
+            let tps = total_tokens as f64 / elapsed;
+            let prompts_remaining = (total - i - 1) as f64;
+            let secs_per_prompt = elapsed / done;
+            let eta_secs = (prompts_remaining * secs_per_prompt) as u64;
+
+            pb.set_message(format!(
+                "{:.1} tok/s | ETA {}",
+                tps,
+                format_duration(eta_secs),
+            ));
+            pb.set_position((i + 1) as u64);
         }
 
-        pb.finish_with_message("Teacher generation complete");
+        let elapsed = start.elapsed().as_secs_f64();
+        let tps = if elapsed > 0.0 { total_tokens as f64 / elapsed } else { 0.0 };
+        pb.finish_with_message(format!(
+            "Phase 1 complete — {remaining} prompts in {} ({:.1} tok/s)",
+            format_duration(elapsed as u64),
+            tps,
+        ));
+
+        info!(
+            path = %cache_path.display(),
+            count = results.len(),
+            "Teacher outputs saved"
+        );
+
         Ok(results)
     }
 
@@ -191,7 +270,6 @@ impl Distiller {
     pub fn train(&mut self, teacher_data: &[DataPoint]) -> Result<TrainingStats> {
         let tokenizer = self.teacher.tokenizer();
 
-        // Build the optimiser from all trainable parameters in the VarMap.
         let params = ParamsAdamW {
             lr: self.config.learning_rate,
             ..Default::default()
@@ -221,26 +299,21 @@ impl Distiller {
 
                 let device = &self.student.device.clone();
 
-                // Build Tensors from the tokenised batch
                 let input_ids = tensor_2d(&tok_batch.input_ids, device)?;
                 let labels = tensor_2d_u32(&tok_batch.labels, device)?;
                 let mask = tensor_2d_f32(&tok_batch.completion_mask, device)?;
 
-                // Forward pass
                 let logits = self.student.forward(&input_ids)
                     .context("Student forward pass failed")?;
 
-                // Masked cross-entropy loss
                 let loss = TrainableStudent::masked_ce_loss(&logits, &labels, &mask)
                     .context("Loss computation failed")?;
 
                 last_loss = loss.to_scalar::<f32>().unwrap_or(f32::NAN);
 
-                // Count tokens contributing to this step for throughput stats
                 let batch_tokens: usize = tok_batch.input_ids.iter().map(|r| r.len()).sum();
                 total_tokens += batch_tokens;
 
-                // Backward + optimizer step
                 optimizer.backward_step(&loss)
                     .context("Backward/optimizer step failed")?;
 
@@ -268,6 +341,19 @@ impl Distiller {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn phase1_progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) | {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▓░"),
+    );
+    pb.set_message("starting...");
+    pb
+}
+
 fn progress_bar(total: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -281,16 +367,14 @@ fn progress_bar(total: u64, label: &str) -> ProgressBar {
     pb
 }
 
-fn save_teacher_cache(path: &Path, data: &[DataPoint]) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("Cannot create {}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
-    for dp in data {
-        let rec = TeacherRecord { prompt: dp.prompt.clone(), completion: dp.completion.clone() };
-        let line = serde_json::to_string(&rec)?;
-        writeln!(writer, "{line}")?;
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
-    Ok(())
 }
 
 fn load_teacher_cache(path: &Path) -> Result<Vec<DataPoint>> {
@@ -312,7 +396,6 @@ fn load_teacher_cache(path: &Path) -> Result<Vec<DataPoint>> {
 
 // ── Tensor construction helpers ───────────────────────────────────────────────
 
-/// Build a 2D `[batch, seq_len]` U32 tensor from a batch of equal-length rows.
 fn tensor_2d(rows: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     let batch = rows.len();
     let seq = rows.first().map(|r| r.len()).unwrap_or(0);
@@ -325,7 +408,6 @@ fn tensor_2d_u32(rows: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     tensor_2d(rows, device)
 }
 
-/// Build a 2D `[batch, seq_len]` F32 tensor from a batch of equal-length rows.
 fn tensor_2d_f32(rows: &[Vec<f32>], device: &Device) -> Result<Tensor> {
     let batch = rows.len();
     let seq = rows.first().map(|r| r.len()).unwrap_or(0);
