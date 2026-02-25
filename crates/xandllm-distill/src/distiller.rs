@@ -192,6 +192,9 @@ impl Distiller {
 
         let pb = phase1_progress_bar(total as u64);
         pb.set_position(already_done as u64);
+        // When stdout is not a TTY (e.g. Docker, piped output) indicatif hides
+        // itself.  We detect this and fall back to periodic info! log lines.
+        let non_tty = pb.is_hidden();
 
         let start = Instant::now();
         let mut total_tokens: usize = 0;
@@ -231,20 +234,35 @@ impl Distiller {
 
             results.push(DataPoint { prompt: formatted, completion });
 
-            // Update progress bar with tok/s and ETA.
+            // Compute timing stats.
             let done = (i + 1 - already_done) as f64;
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let tps = total_tokens as f64 / elapsed;
             let prompts_remaining = (total - i - 1) as f64;
-            let secs_per_prompt = elapsed / done;
-            let eta_secs = (prompts_remaining * secs_per_prompt) as u64;
+            let eta_secs = (prompts_remaining * (elapsed / done)) as u64;
 
-            pb.set_message(format!(
-                "{:.1} tok/s | ETA {}",
-                tps,
-                format_duration(eta_secs),
-            ));
-            pb.set_position((i + 1) as u64);
+            if non_tty {
+                // Log progress every 50 prompts (and on the last one).
+                let done_count = i + 1 - already_done;
+                if done_count % 50 == 0 || i + 1 == total {
+                    let pct = (i + 1) as f64 / total as f64 * 100.0;
+                    info!(
+                        completed = i + 1,
+                        total,
+                        pct = format!("{:.1}%", pct),
+                        tok_per_sec = format!("{:.1}", tps),
+                        eta = format_duration(eta_secs),
+                        "Phase 1 progress"
+                    );
+                }
+            } else {
+                pb.set_message(format!(
+                    "{:.1} tok/s | ETA {}",
+                    tps,
+                    format_duration(eta_secs),
+                ));
+                pb.set_position((i + 1) as u64);
+            }
         }
 
         let elapsed = start.elapsed().as_secs_f64();
