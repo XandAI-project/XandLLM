@@ -1,0 +1,30 @@
+[package]
+name = "xandllm-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "xandllm"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["xandllm-core/cuda", "xandllm-api/cuda", "xandllm-distill/cuda"]
+metal = ["xandllm-core/metal", "xandllm-api/metal", "xandllm-distill/metal"]
+
+[dependencies]
+xandllm-core    = { path = "../xandllm-core" }
+xandllm-hub     = { path = "../xandllm-hub" }
+xandllm-api     = { path = "../xandllm-api" }
+xandllm-distill = { path = "../xandllm-distill" }
+clap.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+config.workspace = true
+dirs.workspace = true
+indicatif.workspace = true

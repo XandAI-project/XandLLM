@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Environment / secrets
+.env
+*.env.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Model cache (large binary files — use HF Hub instead)
+~/.cache/xandllm/
+
+# Logs
+*.log
+
+# Docker
+docker/.env
+
+
+/internal/

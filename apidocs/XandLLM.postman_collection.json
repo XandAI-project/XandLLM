@@ -1,0 +1,385 @@
+{
+  "info": {
+    "name": "XandLLM API",
+    "description": "OpenAI-compatible REST API for the XandLLM inference engine.\n\n## Setup\n\n1. Start the server:\n   ```\n   xandllm serve --model Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --port 11435 --gpu\n   ```\n2. Set the `base_url` collection variable to `http://localhost:11435` (default).\n3. Set `model` to the model id you loaded.\n\n## Parameters reference\n\n| Parameter | Type | Default | Description |\n|---|---|---|---|\n| `model` | string | required | Model id (must match what was loaded) |\n| `stream` | bool | false | Stream tokens via SSE |\n| `max_tokens` | int | 512 | Maximum new tokens to generate |\n| `temperature` | float | 0.7 | Sampling temperature (0 = greedy, >1 = more random) |\n| `top_p` | float | 0.9 | Nucleus sampling threshold |\n| `top_k` | int | — | Limit vocabulary to top-K tokens |\n| `repetition_penalty` | float | 1.0 | >1 discourages repeating tokens |\n| `frequency_penalty` | float | 0.0 | OpenAI-style frequency penalty |\n| `presence_penalty` | float | 0.0 | OpenAI-style presence penalty |\n| `seed` | int | — | Fixed seed for reproducible output |\n| `stop` | string \\| string[] | — | Custom stop sequences |\n| `n` | int | — | Number of completions (reserved) |",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "1.0.0"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:11435",
+      "type": "string",
+      "description": "Base URL of the XandLLM server"
+    },
+    {
+      "key": "model",
+      "value": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+      "type": "string",
+      "description": "Model id loaded into the server (must match --model flag)"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe. Returns `{\"status\":\"ok\"}` when the server is ready to accept requests."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Models",
+      "item": [
+        {
+          "name": "GET /v1/models",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/v1/models",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "models"]
+            },
+            "description": "List models currently loaded in the server. Returns an OpenAI-compatible `ModelList` object."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"id\": \"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\",\n      \"object\": \"model\",\n      \"created\": 1708000000,\n      \"owned_by\": \"xandllm\"\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Chat Completions",
+      "item": [
+        {
+          "name": "Chat — Simple (non-streaming)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"What is the capital of France?\" }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 128\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Minimal chat completion request. Returns the full assistant reply in a single JSON response."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"id\": \"chatcmpl-a1b2c3\",\n  \"object\": \"chat.completion\",\n  \"created\": 1708000000,\n  \"model\": \"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"The capital of France is Paris.\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 12,\n    \"completion_tokens\": 8,\n    \"total_tokens\": 20\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Chat — Streaming (SSE)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "Accept", "value": "text/event-stream"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Write a short poem about Rust programming.\" }\n  ],\n  \"stream\": true,\n  \"max_tokens\": 256,\n  \"temperature\": 0.8\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Streaming chat completion via Server-Sent Events. Each event contains a `chat.completion.chunk` object with a `delta.content` field. The stream ends with `data: [DONE]`.\n\n**Example SSE stream:**\n```\ndata: {\"id\":\"chatcmpl-...\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Rust\"},...}]}\ndata: {\"id\":\"chatcmpl-...\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\" is\"},...}]}\n...\ndata: [DONE]\n```"
+          }
+        },
+        {
+          "name": "Chat — With System Prompt",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an expert Rust programmer. Be concise and always show code examples.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"How do I read a file line by line in Rust?\"\n    }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 512,\n  \"temperature\": 0.7\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Chat request with a system message. The system message controls the model's persona and behaviour throughout the conversation."
+          }
+        },
+        {
+          "name": "Chat — Multi-Turn Conversation",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    { \"role\": \"system\",    \"content\": \"You are a helpful coding assistant.\" },\n    { \"role\": \"user\",      \"content\": \"What is a closure in Rust?\" },\n    { \"role\": \"assistant\", \"content\": \"A closure in Rust is an anonymous function that can capture variables from its surrounding scope...\" },\n    { \"role\": \"user\",      \"content\": \"Show me a quick example.\" }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 256\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Multi-turn conversation. Pass the full message history (alternating user/assistant turns) with each request. The model uses this context to generate a coherent continuation."
+          }
+        },
+        {
+          "name": "Chat — Code Generation",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior software engineer. Return only code, no explanations.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a Rust function that calculates the Fibonacci sequence iteratively up to n.\"\n    }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 512,\n  \"temperature\": 0.2,\n  \"top_p\": 0.95,\n  \"repetition_penalty\": 1.1\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Optimised settings for code generation: low temperature (0.2) for determinism, slightly elevated `top_p`, and a modest `repetition_penalty` to avoid repeated lines."
+          }
+        },
+        {
+          "name": "Chat — All Parameters",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"You are a helpful assistant.\" },\n    { \"role\": \"user\",   \"content\": \"Tell me a short story about a robot.\" }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 512,\n  \"temperature\": 0.9,\n  \"top_p\": 0.95,\n  \"top_k\": 50,\n  \"repetition_penalty\": 1.15,\n  \"frequency_penalty\": 0.2,\n  \"presence_penalty\": 0.1,\n  \"seed\": 42,\n  \"stop\": [\"The end.\", \"\\n\\n\"]\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Demonstrates every supported parameter:\n\n| Field | Value | Notes |\n|---|---|---|\n| `temperature` | 0.9 | Higher = more creative |\n| `top_p` | 0.95 | Nucleus sampling |\n| `top_k` | 50 | Hard vocab cutoff |\n| `repetition_penalty` | 1.15 | Discourages repeated tokens |\n| `frequency_penalty` | 0.2 | OpenAI-style token frequency penalty |\n| `presence_penalty` | 0.1 | OpenAI-style presence penalty |\n| `seed` | 42 | Reproducible output |\n| `stop` | array | Stop on these strings |"
+          }
+        },
+        {
+          "name": "Chat — Deterministic / Greedy",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"What is 2 + 2? Answer with the number only.\" }\n  ],\n  \"stream\": false,\n  \"max_tokens\": 5,\n  \"temperature\": 0.0,\n  \"seed\": 1\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Greedy (deterministic) decoding: set `temperature` to 0. Combined with a fixed `seed` this always produces the same output — useful for testing."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Text Completions",
+      "item": [
+        {
+          "name": "Completion — Simple (non-streaming)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"The capital of Germany is\",\n  \"max_tokens\": 10,\n  \"stream\": false\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Raw text completion endpoint. The model continues the prompt directly without any chat template applied. Useful for base/completion models or when you want full control over the prompt format."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"id\": \"cmpl-x9y8z7\",\n  \"object\": \"text_completion\",\n  \"created\": 1708000000,\n  \"model\": \"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\",\n  \"choices\": [\n    {\n      \"text\": \" Berlin.\",\n      \"index\": 0,\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 7,\n    \"completion_tokens\": 2,\n    \"total_tokens\": 9\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Completion — Streaming (SSE)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "completions"]
+            },
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "Accept", "value": "text/event-stream"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"Once upon a time in a land far away,\",\n  \"max_tokens\": 128,\n  \"stream\": true,\n  \"temperature\": 0.9\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Streaming text completion. Each SSE event contains a `text_completion` chunk. The stream ends with `data: [DONE]`."
+          }
+        },
+        {
+          "name": "Completion — Code Fill-In",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"fn add(a: i32, b: i32) -> i32 {\",\n  \"max_tokens\": 64,\n  \"stream\": false,\n  \"temperature\": 0.1,\n  \"stop\": [\"}\", \"\\n\\n\"]\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Code fill-in using raw completion. The `stop` field halts generation at the closing brace, making this useful for function body completion."
+          }
+        },
+        {
+          "name": "Completion — All Parameters",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"Rust is a systems programming language that\",\n  \"stream\": false,\n  \"max_tokens\": 256,\n  \"temperature\": 0.85,\n  \"top_p\": 0.92,\n  \"top_k\": 40,\n  \"repetition_penalty\": 1.2,\n  \"frequency_penalty\": 0.1,\n  \"presence_penalty\": 0.05,\n  \"seed\": 99,\n  \"stop\": [\"\\n\\n\", \"In conclusion\"]\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "All supported completion parameters in one request. Refer to the collection description for a full parameter reference."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Error Cases",
+      "item": [
+        {
+          "name": "400 — Empty messages array",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": []\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "The `messages` array must not be empty. Expects a 400 Bad Request response."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"error\": \"messages array must not be empty\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "400 — Malformed JSON",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{invalid json}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "Malformed JSON in the request body. Expects a 400 Bad Request response."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"error\": \"Failed to parse the request body as JSON\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "400 — Invalid stop type",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [{ \"role\": \"user\", \"content\": \"hi\" }],\n  \"stop\": 123\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "description": "`stop` must be a string or an array of strings. Passing a number returns 400."
+          }
+        }
+      ]
+    }
+  ]
+}

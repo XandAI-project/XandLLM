@@ -1,0 +1,27 @@
+[server]
+host = "0.0.0.0"
+port = 11435
+request_timeout_secs = 120
+
+[inference]
+max_batch_size = 8
+max_sequence_length = 8192
+default_max_new_tokens = 512
+temperature = 0.7
+top_p = 0.9
+
+[model]
+# Default: LLaMA 3.1 8B Instruct, Q4_K_M quantized.
+# Requires a Hugging Face account with the Meta LLaMA 3.1 license accepted.
+# Set HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) in your environment before pulling.
+#
+# Pull command:
+#   xandllm pull bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+#     --gguf-file Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+default_model_id = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+default_gguf_file = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+cache_dir = "~/.cache/xandllm"
+
+[device]
+prefer_gpu = true
+cuda_device_id = 0

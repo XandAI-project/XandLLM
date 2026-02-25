@@ -1,0 +1,20 @@
+[package]
+name = "xandllm-hub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hf-hub.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+indicatif.workspace = true
+sha2.workspace = true
+hex.workspace = true
+dirs.workspace = true
+futures.workspace = true
+bytes.workspace = true

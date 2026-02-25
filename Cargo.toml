@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/xandllm-core",
+    "crates/xandllm-hub",
+    "crates/xandllm-api",
+    "crates/xandllm-cli",
+    "crates/xandllm-distill",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["XandNet"]
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util", "timeout"] }
+tower-http = { version = "0.5", features = ["trace", "timeout", "request-id", "util", "cors"] }
+hyper = { version = "1" }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Model / ML
+candle-core = { version = "0.8" }
+candle-nn = { version = "0.8" }
+candle-transformers = { version = "0.8" }
+
+# Tokenization
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+# HF Hub
+hf-hub = { version = "0.3", features = ["tokio"] }
+reqwest = { version = "0.11", features = ["stream"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Config
+config = "0.14"
+
+# Progress bars
+indicatif = "0.17"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+dirs = "5"
+futures = "0.3"
+bytes = "1"
+http-body-util = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
