@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{loss, VarBuilder, VarMap};
 use candle_transformers::models::llama::{
     Cache, Config as LlamaConfig, Llama as CandleLlama,
@@ -150,85 +150,84 @@ impl TrainableStudent {
         Ok(Self { model, varmap, cache, config, tokenizer, device: device.clone() })
     }
 
-    // ── Forward pass ──────────────────────────────────────────────────────────
+    // ── Training step ─────────────────────────────────────────────────────────
 
-    /// Run a forward pass and return the full logit tensor.
+    /// Compute the distillation loss for one batch and return a scalar tensor
+    /// suitable for calling `.backward()` on.
     ///
-    /// `input_ids` shape: `[batch, seq_len]`.
-    /// Returns flattened shape: `[batch * seq_len, vocab_size]`.
+    /// ## Why not a plain `forward()` returning full-sequence logits?
     ///
-    /// Each sample in the batch is processed independently (the Candle Llama
-    /// model does not natively support batched training), then stacked.
-    pub fn forward(&mut self, input_ids: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len) = input_ids.dims2()
+    /// `candle_transformers::Llama::forward` is built for *inference*: it
+    /// slices the hidden states to the **last position** before the LM head,
+    /// always returning `[batch, vocab]` regardless of input length.  There is
+    /// no public API to recover per-position logits from the built-in model.
+    ///
+    /// ## What this does instead — multi-position teacher forcing
+    ///
+    /// For every sample we run **two** forward passes:
+    ///
+    /// 1. **Full sequence** (`input_ids`): model sees `[prompt ++ completion[:-1]]`
+    ///    and predicts the **last completion token** — the most context-rich signal.
+    ///
+    /// 2. **Prompt only** (`input_ids[:, :prompt_end]`): model sees only the
+    ///    prompt and predicts the **first completion token** — the hardest and
+    ///    most informative step for generation quality.
+    ///
+    /// Both losses are averaged, giving two gradient signals per example with
+    /// the same number of backward passes as a single-position approach.
+    ///
+    /// `prompt_lengths`: number of prompt tokens per sample (before completion).
+    /// `last_labels`:    last-token label per sample (shape `[batch]`).
+    /// `first_labels`:   first completion label per sample (shape `[batch]`).
+    pub fn train_step(
+        &mut self,
+        input_ids: &Tensor,
+        prompt_lengths: &[usize],
+        last_labels: &[u32],
+        first_labels: &[u32],
+    ) -> Result<Tensor> {
+        let (batch, _seq_len) = input_ids.dims2()
             .context("Expected 2-D input_ids [batch, seq_len]")?;
+        let device = &self.device.clone();
 
-        let mut per_sample: Vec<Tensor> = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let ids = input_ids.i(b)?;     // [seq_len]
-            let ids = ids.unsqueeze(0)?;   // [1, seq_len]
-            // Position 0: we process the full sequence in one shot (no KV cache).
-            let logits = self.model.forward(&ids, 0, &mut self.cache)?; // [1, seq_len, vocab]
-            let logits = logits.squeeze(0)?; // [seq_len, vocab]
-            per_sample.push(logits);
-        }
+        // ── Loss 1: full-sequence prediction of last completion token ─────────
+        let logits_full = self.model.forward(input_ids, 0, &mut self.cache)?;
+        // logits_full: [batch, vocab]
+        let logits_f32 = to_f32(&logits_full)?;
+        let labels_last = Tensor::new(last_labels, device)?.to_dtype(DType::U32)?;
+        let loss_last = loss::cross_entropy(&logits_f32, &labels_last)
+            .context("cross_entropy (last token) failed")?
+            .mean_all()
+            .context("mean (last token) failed")?;
 
-        // Stack → [batch, seq_len, vocab], then flatten → [batch*seq_len, vocab]
-        let stacked = Tensor::stack(&per_sample, 0)?;
-        let vocab = stacked.dim(2)?;
-        stacked.reshape((batch * seq_len, vocab))
-            .context("reshape failed in student forward")
+        // ── Loss 2: prompt-only prediction of first completion token ──────────
+        // Build the shortest prefix across the batch (minimum prompt length).
+        // This still covers all samples because we feed only up to prompt_end.
+        let min_prompt = *prompt_lengths.iter().min().unwrap_or(&1);
+        let prompt_only = input_ids.narrow(1, 0, min_prompt.max(1))?;
+
+        let logits_prompt = self.model.forward(&prompt_only, 0, &mut self.cache)?;
+        let logits_prompt_f32 = to_f32(&logits_prompt)?;
+        let labels_first = Tensor::new(first_labels, device)?.to_dtype(DType::U32)?;
+        let loss_first = loss::cross_entropy(&logits_prompt_f32, &labels_first)
+            .context("cross_entropy (first token) failed")?
+            .mean_all()
+            .context("mean (first token) failed")?;
+
+        // Average both losses — equal weight.
+        ((loss_last + loss_first)? / 2.0).context("loss averaging failed")
     }
 
-    // ── Loss ──────────────────────────────────────────────────────────────────
+    // ── Forward (kept for export/evaluation — not used in training) ───────────
 
-    /// Compute cross-entropy loss masked to completion tokens only.
+    /// Run one forward pass on `input_ids` and return `[batch, vocab]` logits
+    /// for the **last position** of each sequence.
     ///
-    /// * `logits` — `[N, vocab_size]` (already flattened; may be BF16 or F32)
-    /// * `labels` — `[batch, seq_len]` next-token ids (u32)
-    /// * `mask`   — `[batch, seq_len]` 1.0 for completion tokens, 0.0 for prompt
-    ///
-    /// Returns the mean cross-entropy over the masked (completion) positions.
-    ///
-    /// Logits are always cast to F32 before loss computation regardless of the
-    /// model's training dtype.  BF16 softmax is numerically unstable for large
-    /// vocabularies (overflow in exp), so this F32 cast is the standard
-    /// "mixed-precision lite" practice used by llama.cpp, Transformers, and nanoGPT.
-    pub fn masked_ce_loss(
-        logits: &Tensor,
-        labels: &Tensor,
-        mask: &Tensor,
-    ) -> Result<Tensor> {
-        let device = logits.device();
-        let (batch, seq) = labels.dims2()?;
-        let n = batch * seq;
-
-        // Cast to F32 for stable cross-entropy — cheap GPU dtype conversion.
-        let logits = if logits.dtype() != DType::F32 {
-            logits.to_dtype(DType::F32)?
-        } else {
-            logits.clone()
-        };
-
-        let labels_flat = labels.reshape(n)?.to_dtype(DType::U32)?;
-        let mask_flat = mask.reshape(n)?.to_dtype(DType::F32)?;
-
-        // Per-position cross-entropy → shape [n]
-        let ce = loss::cross_entropy(&logits, &labels_flat)
-            .context("cross_entropy computation failed")?;
-
-        // Zero-out prompt positions
-        let masked = (ce * &mask_flat)?;
-
-        // Mean over completion tokens; guard against empty mask
-        let denom = mask_flat.sum_all()?.to_scalar::<f32>()?;
-        if denom < 1e-6 {
-            Tensor::zeros((), DType::F32, device).context("zero-loss tensor")
-        } else {
-            let total = masked.sum_all()?;
-            let denom_t = Tensor::new(denom, device)?;
-            (total / denom_t).context("loss mean computation failed")
-        }
+    /// > **Note:** `candle_transformers::Llama` only exposes last-token logits.
+    /// > Use [`train_step`] for gradient-based training.
+    pub fn forward(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        self.model.forward(input_ids, 0, &mut self.cache)
+            .context("Student forward pass failed")
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -256,6 +255,20 @@ impl TrainableStudent {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Cast `t` to F32 if it is not already; no-op if already F32.
+///
+/// Cross-entropy / softmax over large vocabularies is numerically unstable in
+/// BF16 — exp() overflows easily.  Always computing the loss in F32 is the
+/// standard "mixed-precision lite" practice (used by llama.cpp, Transformers,
+/// and nanoGPT) and adds negligible overhead.
+fn to_f32(t: &Tensor) -> Result<Tensor> {
+    if t.dtype() == DType::F32 {
+        Ok(t.clone())
+    } else {
+        t.to_dtype(DType::F32).context("dtype cast to F32 failed")
+    }
+}
 
 fn read_hf_config(model_dir: &Path) -> Result<LlamaConfig> {
     let path = model_dir.join("config.json");
