@@ -16,6 +16,7 @@ RUN for i in 1 2 3; do apt-get update && break || (echo "[apt] retry $i/3..." &&
         ca-certificates \
         build-essential \
         clang \
+        libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust + cargo-chef in one layer.
@@ -70,6 +71,7 @@ RUN for i in 1 2 3; do apt-get update && break || (echo "[apt] retry $i/3..." &&
         libssl3 \
         ca-certificates \
         curl \
+        libopenblas0-openmp \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from the builder stage

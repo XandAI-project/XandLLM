@@ -20,6 +20,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+// Phase 1 uses indicatif for its rich progress bar (it runs in foreground with a TTY
+// from the distill-docker.sh wrapper).  Phase 2 replaces the bar with explicit info!
+// logs because `docker run` without `-t` suppresses indicatif output entirely.
+
 use xandllm_core::{chat_template, Tokenizer};
 
 use crate::dataset::{DataLoader, DataPoint};
@@ -130,13 +134,23 @@ impl Phase2Runner {
         teacher_data: &[DataPoint],
         tokenizer: Arc<Tokenizer>,
     ) -> Result<(TrainingStats, TrainableStudent)> {
+        let total_batches_per_epoch =
+            (teacher_data.len() + self.config.batch_size - 1) / self.config.batch_size;
+        let total_steps = total_batches_per_epoch * self.config.epochs;
+
         info!(
             examples = teacher_data.len(),
             epochs = self.config.epochs,
             batch_size = self.config.batch_size,
             lr = self.config.learning_rate,
-            "Phase 2: training student"
+            total_steps,
+            "Phase 2: starting student training"
         );
+
+        // Phase 2 uses explicit info! logs instead of indicatif because Docker
+        // runs without a TTY and indicatif renders nothing in that environment.
+        // Every step emits a log line so the user can confirm the process is alive.
+        info!("Phase 2: initializing AdamW optimizer (may take a moment for large models)");
 
         let params = ParamsAdamW {
             lr: self.config.learning_rate,
@@ -145,11 +159,7 @@ impl Phase2Runner {
         let mut optimizer = AdamW::new(self.student.trainable_vars(), params)
             .context("Failed to create AdamW optimiser")?;
 
-        let total_batches_per_epoch =
-            (teacher_data.len() + self.config.batch_size - 1) / self.config.batch_size;
-        let total_steps = total_batches_per_epoch * self.config.epochs;
-
-        let pb = progress_bar(total_steps as u64, "Student training");
+        info!(total_steps, "Phase 2: optimizer ready — entering training loop");
 
         let mut step = 0usize;
         let mut last_loss = 0.0f32;
@@ -157,6 +167,13 @@ impl Phase2Runner {
         let start = Instant::now();
 
         for epoch in 0..self.config.epochs {
+            info!(
+                epoch = epoch + 1,
+                total_epochs = self.config.epochs,
+                "Phase 2: epoch start"
+            );
+            let epoch_start = Instant::now();
+
             for batch in teacher_data.chunks(self.config.batch_size) {
                 let tok_batch = DataLoader::tokenize_batch(
                     batch,
@@ -165,7 +182,18 @@ impl Phase2Runner {
                 )
                 .context("Tokenisation error")?;
 
+                let seq_len = tok_batch.input_ids.first().map(|r| r.len()).unwrap_or(0);
                 let device = &self.student.device.clone();
+
+                info!(
+                    step = step + 1,
+                    total_steps,
+                    epoch = epoch + 1,
+                    seq_len,
+                    "Phase 2: step start (forward+backward may take several minutes on CPU)"
+                );
+
+                let step_start = Instant::now();
 
                 // Build input tensor [batch, seq_len].
                 let input_ids = tensor_2d(&tok_batch.input_ids, device)?;
@@ -222,19 +250,38 @@ impl Phase2Runner {
                     .context("Backward/optimizer step failed")?;
 
                 step += 1;
-                pb.set_message(format!(
-                    "epoch {}/{} loss {:.4}",
-                    epoch + 1,
-                    self.config.epochs,
-                    last_loss
-                ));
-                pb.inc(1);
+
+                let step_secs = step_start.elapsed().as_secs_f64();
+                let elapsed = start.elapsed().as_secs_f64();
+                let steps_remaining = total_steps.saturating_sub(step);
+                let avg_secs_per_step = if step > 0 { elapsed / step as f64 } else { step_secs };
+                let eta_secs = (avg_secs_per_step * steps_remaining as f64) as u64;
+
+                info!(
+                    step,
+                    total_steps,
+                    epoch = epoch + 1,
+                    loss = format!("{:.4}", last_loss),
+                    step_secs = format!("{:.1}s", step_secs),
+                    eta = format_duration(eta_secs),
+                    "Phase 2: step complete"
+                );
             }
 
-            info!(epoch = epoch + 1, loss = last_loss, "Epoch complete");
+            let epoch_secs = epoch_start.elapsed().as_secs_f64();
+            info!(
+                epoch = epoch + 1,
+                loss = format!("{:.4}", last_loss),
+                epoch_secs = format!("{:.1}s", epoch_secs),
+                "Phase 2: epoch complete"
+            );
         }
 
-        pb.finish_with_message(format!("Training complete — final loss {last_loss:.4}"));
+        info!(
+            final_loss = format!("{:.4}", last_loss),
+            total_steps = step,
+            "Phase 2: training complete"
+        );
 
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 { total_tokens as f64 / elapsed } else { 0.0 };
@@ -383,19 +430,6 @@ fn phase1_progress_bar(total: u64) -> ProgressBar {
         .progress_chars("█▓░"),
     );
     pb.set_message("starting...");
-    pb
-}
-
-fn progress_bar(total: u64, label: &str) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .progress_chars("█▓░"),
-    );
-    pb.set_message(label.to_string());
     pb
 }
 
