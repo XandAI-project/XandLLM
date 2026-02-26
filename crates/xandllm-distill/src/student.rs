@@ -107,7 +107,7 @@ impl TrainableStudent {
     /// | CUDA   | BF16          | ~50 % (1B: 4.4 GB → 2.2 GB) |
     ///
     /// The forward pass runs in BF16 on GPU.  The cross-entropy loss is cast to
-    /// F32 before computation (`masked_ce_loss`) to preserve numerical accuracy
+    /// F32 before computation (`train_step`) to preserve numerical accuracy
     /// in the probability distribution — this is the standard "mixed-precision
     /// lite" approach used by llama.cpp and transformers training scripts.
     fn build(
@@ -186,7 +186,7 @@ impl TrainableStudent {
         last_labels: &[u32],
         first_labels: &[u32],
     ) -> Result<Tensor> {
-        let (batch, _seq_len) = input_ids.dims2()
+        let (_batch, _seq_len) = input_ids.dims2()
             .context("Expected 2-D input_ids [batch, seq_len]")?;
         let device = &self.device.clone();
 

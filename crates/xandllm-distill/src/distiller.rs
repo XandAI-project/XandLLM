@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -166,18 +166,52 @@ impl Phase2Runner {
                 .context("Tokenisation error")?;
 
                 let device = &self.student.device.clone();
-                // Build token tensors and move them to the student's device.
-                // input_ids stay U32 (embedding lookup doesn't care about dtype).
-                // labels and mask are always F32 — loss computation casts internally.
+
+                // Build input tensor [batch, seq_len].
                 let input_ids = tensor_2d(&tok_batch.input_ids, device)?;
-                let labels = tensor_2d_u32(&tok_batch.labels, device)?;
-                let mask = tensor_2d_f32(&tok_batch.completion_mask, device)?;
 
-                let logits = self.student.forward(&input_ids)
-                    .context("Student forward pass failed")?;
+                // Derive per-sample training targets from the tokenized batch.
+                //
+                // `candle_transformers::Llama::forward` always returns logits for the
+                // LAST position only ([batch, vocab]).  We therefore run two forward
+                // passes per step and average their losses:
+                //
+                //   Pass 1 — full sequence  → predicts last completion token
+                //   Pass 2 — prompt prefix  → predicts first completion token
+                //
+                // Targets are extracted from `labels` (next-token targets) using
+                // `completion_mask` to locate the first/last completion positions.
+                let mut prompt_lengths = Vec::with_capacity(tok_batch.input_ids.len());
+                let mut last_labels   = Vec::with_capacity(tok_batch.input_ids.len());
+                let mut first_labels  = Vec::with_capacity(tok_batch.input_ids.len());
 
-                let loss = TrainableStudent::masked_ce_loss(&logits, &labels, &mask)
-                    .context("Loss computation failed")?;
+                for (i, (labels_row, mask_row)) in tok_batch.labels
+                    .iter()
+                    .zip(&tok_batch.completion_mask)
+                    .enumerate()
+                {
+                    // First completion index: first mask position that is 1.0.
+                    let first_comp = mask_row.iter().position(|&m| m > 0.5).unwrap_or(0);
+                    // Number of tokens to feed to predict the first completion token.
+                    // input_ids[0..first_comp+1] = full[0..first_comp+1] ends with p_{P-1},
+                    // so the model predicts full[first_comp+1] = c_0.
+                    let prompt_len = (first_comp + 1).min(tok_batch.input_ids[i].len());
+                    prompt_lengths.push(prompt_len);
+
+                    first_labels.push(
+                        labels_row.get(first_comp).copied().unwrap_or(0)
+                    );
+
+                    // Last completion index: last mask position that is 1.0.
+                    let last_comp = mask_row.iter().rposition(|&m| m > 0.5).unwrap_or(first_comp);
+                    last_labels.push(
+                        labels_row.get(last_comp).copied().unwrap_or(0)
+                    );
+                }
+
+                let loss = self.student
+                    .train_step(&input_ids, &prompt_lengths, &last_labels, &first_labels)
+                    .context("Student train_step failed")?;
 
                 last_loss = loss.to_scalar::<f32>().unwrap_or(f32::NAN);
 
@@ -394,20 +428,9 @@ fn load_teacher_cache(path: &Path) -> Result<Vec<DataPoint>> {
 
 // ── Tensor helpers ────────────────────────────────────────────────────────────
 
-fn tensor_2d(rows: &[Vec<u32>], device: &Device) -> Result<Tensor> {
+fn tensor_2d(rows: &[Vec<u32>], device: &candle_core::Device) -> Result<Tensor> {
     let batch = rows.len();
     let seq = rows.first().map(|r| r.len()).unwrap_or(0);
     let flat: Vec<u32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
     Tensor::from_vec(flat, (batch, seq), device).context("Failed to build u32 tensor")
-}
-
-fn tensor_2d_u32(rows: &[Vec<u32>], device: &Device) -> Result<Tensor> {
-    tensor_2d(rows, device)
-}
-
-fn tensor_2d_f32(rows: &[Vec<f32>], device: &Device) -> Result<Tensor> {
-    let batch = rows.len();
-    let seq = rows.first().map(|r| r.len()).unwrap_or(0);
-    let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-    Tensor::from_vec(flat, (batch, seq), device).context("Failed to build f32 tensor")
 }
