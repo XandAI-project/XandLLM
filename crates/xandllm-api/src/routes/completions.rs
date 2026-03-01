@@ -7,13 +7,14 @@ use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use xandllm_core::{GenerateInput, Model, SamplingParams};
 
 use crate::{
     error::{ApiError, ApiResult},
+    server::{ChatFormat, ModelId},
     streaming::{sse_done, sse_event},
     types::{
         CompletionChunk, CompletionChoice, CompletionRequest, CompletionResponse,
@@ -59,9 +60,9 @@ fn parse_stop_sequences(
 #[instrument(skip_all, fields(model = %req.model, stream = req.stream))]
 pub async fn create_completion(
     Extension(model): Extension<Arc<Mutex<dyn Model + Send>>>,
-    Extension(model_id): Extension<Arc<String>>,
+    Extension(ModelId(model_id)): Extension<ModelId>,
     Extension(tokenizer): Extension<Arc<xandllm_core::Tokenizer>>,
-    Extension(chat_format): Extension<Arc<String>>,
+    Extension(ChatFormat(chat_format)): Extension<ChatFormat>,
     Json(req): Json<CompletionRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Collect format-specific stop tokens (e.g. <|im_end|> for ChatML, <|eot_id|> for LLaMA-3)
@@ -93,12 +94,32 @@ pub async fn create_completion(
         greedy: false,
         stop_token_ids,
         repeat_last_n: Some(64),
+        // Plain completions endpoint has no chat format — no text stop strings needed.
+        stop_strings: vec![],
+        thinking_mode: false,
     };
 
+    info!(
+        prompt_len = req.prompt.len(),
+        prompt = %req.prompt,
+        "Raw completion prompt (no template applied)"
+    );
+
+    // add_special_tokens=false: completions prompts are passed as-is; any
+    // necessary BOS handling is the caller's responsibility.  Using true
+    // would silently prepend BOS for models whose tokenizer.json post-
+    // processor is configured to do so, which is unexpected for raw completions.
     let token_ids = tokenizer
-        .encode(&req.prompt, true)
+        .encode(&req.prompt, false)
         .map_err(ApiError::Model)?;
     let prompt_tokens = token_ids.len();
+
+    info!(
+        prompt_tokens,
+        stop_token_ids = ?params.stop_token_ids,
+        "Completion prompt encoded"
+    );
+
     let input = GenerateInput { token_ids };
 
     if req.stream {

@@ -7,6 +7,9 @@ edition.workspace = true
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# Enable the custom C/CUDA Gemma 3 engine (replaces candle for GGUF inference).
+# Requires nvcc and a CUDA toolkit (v11.8+) to be installed.
+cuda_engine = []
 
 [dependencies]
 candle-core.workspace = true
@@ -21,3 +24,7 @@ tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

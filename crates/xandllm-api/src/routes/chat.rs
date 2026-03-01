@@ -7,13 +7,14 @@ use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use xandllm_core::{GenerateInput, Model, SamplingParams};
 
 use crate::{
     error::{ApiError, ApiResult},
+    server::{ChatFormat, ModelId},
     streaming::{sse_done, sse_event},
     types::{
         ChatChoice, ChatCompletionChunk, ChatCompletionMessage, ChatCompletionRequest,
@@ -28,7 +29,7 @@ use crate::{
 /// `chat_template::build_chat_prompt`, which ensures correct formatting
 /// regardless of architecture.
 fn messages_to_prompt(fmt: &str, messages: &[crate::types::ChatMessage]) -> String {
-    let system = messages
+    let base_system = messages
         .iter()
         .find(|m| m.role == "system")
         .map(|m| m.content.as_str())
@@ -37,28 +38,39 @@ fn messages_to_prompt(fmt: &str, messages: &[crate::types::ChatMessage]) -> Stri
     let non_system: Vec<&crate::types::ChatMessage> =
         messages.iter().filter(|m| m.role != "system").collect();
 
-    // Build alternating (user, assistant) history, excluding the last user turn.
+    // Build alternating (user, assistant) history pairs.
     let mut history: Vec<(String, String)> = Vec::new();
     let mut i = 0;
-    while i + 1 < non_system.len() {
-        if non_system[i].role == "user" && non_system[i + 1].role == "assistant" {
-            history.push((
-                non_system[i].content.clone(),
-                non_system[i + 1].content.clone(),
-            ));
-            i += 2;
+
+    while i < non_system.len() {
+        let msg = non_system[i];
+
+        if msg.role == "user" {
+            if i + 1 < non_system.len() && non_system[i + 1].role == "assistant" {
+                let asst = non_system[i + 1];
+                history.push((msg.content.clone(), asst.content.clone()));
+                i += 2;
+            } else if i + 1 < non_system.len() && non_system[i + 1].role == "user" {
+                // Consecutive user messages (assistant response is missing).
+                // Skip the first user message and continue to process the second.
+                i += 1;
+                continue;
+            } else {
+                // This is the final, unanswered user turn — stop here.
+                break;
+            }
         } else {
             i += 1;
         }
     }
 
     let user_msg = non_system
-        .last()
+        .get(i)
         .filter(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .unwrap_or("");
 
-    xandllm_core::chat_template::build_chat_prompt(fmt, system, &history, user_msg)
+    xandllm_core::chat_template::build_chat_prompt(fmt, base_system, &history, user_msg)
 }
 
 /// Parse the `stop` field from the API request and convert stop strings to token IDs.
@@ -104,9 +116,9 @@ fn parse_stop_sequences(
 #[instrument(skip_all, fields(model = %req.model, stream = req.stream))]
 pub async fn create_chat_completion(
     Extension(model): Extension<Arc<Mutex<dyn Model + Send>>>,
-    Extension(model_id): Extension<Arc<String>>,
+    Extension(ModelId(model_id)): Extension<ModelId>,
     Extension(tokenizer): Extension<Arc<xandllm_core::Tokenizer>>,
-    Extension(chat_format): Extension<Arc<String>>,
+    Extension(ChatFormat(chat_format)): Extension<ChatFormat>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if req.messages.is_empty() {
@@ -117,6 +129,13 @@ pub async fn create_chat_completion(
 
     // Build prompt using the model's actual chat template (not hardcoded ChatML)
     let prompt = messages_to_prompt(&chat_format, &req.messages);
+
+    info!(
+        chat_format = %chat_format,
+        prompt_len = prompt.len(),
+        prompt = %prompt,
+        "Formatted prompt sent to LLM"
+    );
 
     // Collect format-specific stop tokens (e.g. <|im_end|> for ChatML, <|eot_id|> for LLaMA-3)
     let mut stop_token_ids: Vec<u32> = xandllm_core::chat_template::stop_token_strings_for_format(&chat_format)
@@ -135,6 +154,19 @@ pub async fn create_chat_completion(
     let user_stop_ids = parse_stop_sequences(&req.stop, &tokenizer)?;
     stop_token_ids.extend(user_stop_ids);
     
+    // Collect format-specific multi-token text stop strings.
+    // These catch degenerate role-reversal loops (e.g. "\nUser:") that cannot
+    // be expressed as a single stop token ID.
+    let stop_strings: Vec<String> = xandllm_core::chat_template::stop_text_strings_for_format(&chat_format)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Thinking models need their text stop strings suppressed until </think>
+    // is seen — otherwise the reasoning content (which often contains phrases
+    // like "\nAssistant:") triggers a false-positive early stop.
+    let thinking_mode = chat_format.as_str() == "chatml-thinking";
+
     let params = SamplingParams {
         max_new_tokens: req.max_tokens.unwrap_or(512),
         temperature: req.temperature.unwrap_or(0.7),
@@ -147,12 +179,27 @@ pub async fn create_chat_completion(
         greedy: false,
         stop_token_ids,
         repeat_last_n: Some(64),
+        stop_strings,
+        thinking_mode,
     };
 
+    // add_special_tokens=false: the chat template already embeds all special
+    // tokens (BOS, role markers, etc.) as literal text that the tokenizer
+    // recognises as single token IDs.  Using true would cause a double-BOS
+    // for any model whose tokenizer.json post-processor also prepends BOS
+    // (e.g. Gemma models loaded with an external tokenizer.json).
     let token_ids = tokenizer
-        .encode(&prompt, true)
+        .encode(&prompt, false)
         .map_err(ApiError::Model)?;
     let prompt_tokens = token_ids.len();
+
+    info!(
+        prompt_tokens,
+        stop_token_ids = ?params.stop_token_ids,
+        stop_strings = ?params.stop_strings,
+        "Prompt encoded"
+    );
+
     let input = GenerateInput { token_ids };
 
     if req.stream {
@@ -164,9 +211,15 @@ pub async fn create_chat_completion(
         // Fire inference in a blocking thread — do NOT await.
         // Tokens flow into `rx` as they are produced, enabling true per-token streaming.
         tokio::task::spawn_blocking(move || {
-            let mut guard = model_clone.blocking_lock();
-            if let Err(e) = guard.generate_stream(input, params, tx) {
-                tracing::error!(error = %e, "Generation failed");
+            // Catch any panics to prevent the server from crashing
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = model_clone.blocking_lock();
+                if let Err(e) = guard.generate_stream(input, params, tx) {
+                    tracing::error!(error = %e, "Generation failed");
+                }
+            }));
+            if let Err(e) = result {
+                tracing::error!(error = ?e, "Generation thread panicked");
             }
             // tx is dropped here → channel closes → SSE stream ends
         });
@@ -179,16 +232,19 @@ pub async fn create_chat_completion(
         let event_stream = receiver_stream.filter_map(move |result| {
             let event = match result {
                 Ok(token) => {
-                    // Never emit stop-tag text — the core should never send EOS tokens,
-                    // but guard defensively here as well.
                     if token.is_eos || token.text.is_empty() {
                         return std::future::ready(None);
                     }
                     let delta = if first {
                         first = false;
+                        let content = if thinking_mode {
+                            format!("<think>{}", token.text)
+                        } else {
+                            token.text
+                        };
                         ChatDelta {
                             role: Some("assistant".to_string()),
-                            content: Some(token.text),
+                            content: Some(content),
                         }
                     } else {
                         ChatDelta {
@@ -224,19 +280,27 @@ pub async fn create_chat_completion(
         let full_stream = event_stream.chain(done_stream);
 
         Ok(Sse::new(full_stream).into_response())
+
     } else {
-        let rx = {
-            let model = model.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut guard = model.blocking_lock();
+        let model_clone = model.clone();
+        let mut rx = tokio::task::spawn_blocking(move || {
+            // Catch any panics to prevent server crashes
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = model_clone.blocking_lock();
                 guard.generate(input, params)
-            })
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .map_err(ApiError::Model)?
-        };
+            }));
+            match result {
+                Ok(generation_result) => generation_result.map_err(ApiError::Model),
+                Err(e) => {
+                    tracing::error!(error = ?e, "Non-streaming generation panicked");
+                    Err(ApiError::Internal("Generation thread panicked".to_string()))
+                }
+            }
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))
+        .and_then(|inner| inner)?;
         let mut tokens = Vec::new();
-        let mut rx = rx;
         while let Some(result) = rx.recv().await {
             let token = result.map_err(ApiError::Model)?;
             // Never include stop-tag text in the final content
@@ -247,7 +311,13 @@ pub async fn create_chat_completion(
                 tokens.push(token.text);
             }
         }
-        let content: String = tokens.concat();
+        // For thinking models, prepend <think> so clients can detect the reasoning block.
+        let content: String = if thinking_mode {
+            format!("<think>{}", tokens.concat())
+        } else {
+            tokens.concat()
+        };
+
         let completion_tokens = content.split_whitespace().count();
 
         let response = ChatCompletionResponse {

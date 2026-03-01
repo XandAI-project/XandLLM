@@ -128,8 +128,11 @@ impl KvCache {
             value: v_out.clone(),
         });
 
-        // Return only the filled portion for attention.
+        // Advance the fill pointer so subsequent writes land in the right place.
         let filled = write_pos + new_len;
+        self.current_len = filled;
+
+        // Return only the filled portion for attention.
         let k_view = k_out.narrow(2, 0, filled)?;
         let v_view = v_out.narrow(2, 0, filled)?;
 

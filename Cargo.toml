@@ -33,9 +33,9 @@ hyper = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 
 # Model / ML
-candle-core = { version = "0.8" }
-candle-nn = { version = "0.8" }
-candle-transformers = { version = "0.8" }
+candle-core = { version = "0.9" }
+candle-nn = { version = "0.9" }
+candle-transformers = { version = "0.9" }
 
 # Tokenization
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
@@ -48,6 +48,12 @@ reqwest = { version = "0.11", features = ["stream"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
+# Regex
+regex = "1"
+
+# MCP
+# rmcp is not used directly; MCP is implemented via plain HTTP JSON-RPC
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
@@ -57,6 +63,7 @@ config = "0.14"
 
 # Progress bars
 indicatif = "0.17"
+jsonschema = "0.26"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

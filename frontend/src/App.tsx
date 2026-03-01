@@ -70,11 +70,8 @@ export default function App() {
 
   const handleSend = useCallback(
     (text: string) => {
-      // Ensure we have an active conversation
       const id = activeId ?? newConversation();
       if (!activeId) {
-        // newConversation sets activeId asynchronously, so just call send
-        // on next tick
         setTimeout(() => send(text), 0);
       } else {
         void id;
@@ -122,18 +119,20 @@ export default function App() {
       </button>
 
       {/* Main chat area */}
-      <main className="flex-1 flex overflow-hidden">
-        <ChatPane
-          conversation={active}
-          serverStatus={serverStatus}
-          settings={settings}
-          isStreaming={isStreaming}
-          error={error}
-          onSend={handleSend}
-          onAbort={abort}
-          onNew={newConversation}
-          onSettingChange={handleSettingChange}
-        />
+      <main className="flex-1 flex overflow-hidden relative">
+        <div className="flex-1 flex flex-col overflow-hidden relative">
+          <ChatPane
+            conversation={active}
+            serverStatus={serverStatus}
+            settings={settings}
+            isStreaming={isStreaming}
+            error={error}
+            onSend={handleSend}
+            onAbort={abort}
+            onNew={newConversation}
+            onSettingChange={handleSettingChange}
+          />
+        </div>
       </main>
 
       {/* Settings modal */}

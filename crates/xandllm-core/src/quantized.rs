@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Seek;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use candle_core::{quantized::gguf_file, Device, IndexOp, Tensor};
-use candle_transformers::models::{quantized_llama, quantized_qwen2};
+use candle_transformers::models::{quantized_gemma3, quantized_llama, quantized_phi, quantized_phi3, quantized_qwen2, quantized_qwen3};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -15,13 +15,69 @@ use crate::{
     tokenizer::Tokenizer,
 };
 
+// ─── GGUF load error enrichment ───────────────────────────────────────────────
+
+/// Candle emits "unknown dtype for tensor N" when a GGUF file contains an
+/// IQ-family (imatrix) quantization type such as IQ4_XS (dtype 23), IQ3_S,
+/// IQ2_XXS, etc.  These types are used by Unsloth "UD" (Unsloth Dynamic)
+/// mixed-precision files (e.g. *-UD-Q4_K_XL.gguf) and are not implemented
+/// in candle 0.9.x.
+///
+/// This helper intercepts that opaque candle error and replaces it with an
+/// `UnsupportedQuantization` error that names the problematic dtype and tells
+/// the user exactly which quant suffixes to download instead.
+fn map_gguf_load_error(err: candle_core::Error, model_dir: &std::path::Path) -> CoreError {
+    let msg = err.to_string();
+    if msg.contains("unknown dtype") {
+        // Extract the raw dtype number from the error string ("unknown dtype for tensor N").
+        let dtype_hint = msg
+            .split_whitespace()
+            .last()
+            .map(|s| {
+                // Map known IQ dtype numbers to their names for a friendlier message.
+                match s {
+                    "16" => "IQ2_XXS (dtype 16)".to_string(),
+                    "17" => "IQ2_XS (dtype 17)".to_string(),
+                    "18" => "IQ3_XXS (dtype 18)".to_string(),
+                    "19" => "IQ1_S (dtype 19)".to_string(),
+                    "20" => "IQ4_NL (dtype 20)".to_string(),
+                    "21" => "IQ3_S (dtype 21)".to_string(),
+                    "22" => "IQ2_S (dtype 22)".to_string(),
+                    "23" => "IQ4_XS (dtype 23)".to_string(),
+                    "29" => "IQ1_M (dtype 29)".to_string(),
+                    other => format!("dtype {other}"),
+                }
+            })
+            .unwrap_or_else(|| msg.clone());
+
+        // Reconstruct a best-effort repo ID from the cache directory name
+        // (e.g. "unsloth__gemma-3-12b-it-GGUF/main" → "unsloth/gemma-3-12b-it-GGUF").
+        let repo = model_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().replace("__", "/"))
+            .unwrap_or_else(|| "the-model-repo".to_string());
+
+        CoreError::UnsupportedQuantization {
+            detail: dtype_hint,
+            repo,
+        }
+    } else {
+        CoreError::Candle(err)
+    }
+}
+
 // ─── Architecture dispatch ────────────────────────────────────────────────────
 
-/// Wraps either a LLaMA-family or Qwen2 quantized model so both can be used
-/// behind the same `forward` call.
+/// Wraps quantized model weights for all supported architectures behind the
+/// same `forward` call.
 enum QuantizedWeights {
     Llama(quantized_llama::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
+    Qwen3(quantized_qwen3::ModelWeights),
+    Phi2(quantized_phi::ModelWeights),
+    Phi3(quantized_phi3::ModelWeights),
+    Gemma(quantized_gemma3::ModelWeights),
 }
 
 impl QuantizedWeights {
@@ -29,6 +85,20 @@ impl QuantizedWeights {
         match self {
             Self::Llama(m) => m.forward(x, index_pos),
             Self::Qwen2(m) => m.forward(x, index_pos),
+            Self::Qwen3(m) => m.forward(x, index_pos),
+            Self::Phi2(m) => m.forward(x, index_pos),
+            Self::Phi3(m) => m.forward(x, index_pos),
+            Self::Gemma(m) => m.forward(x, index_pos),
+        }
+    }
+
+    /// Reset any internally-managed KV caches that use append semantics
+    /// (e.g. `ConcatKvCache` in Qwen3). Must be called before each new
+    /// full-prompt prefill so stale cache entries from a previous turn don't
+    /// corrupt the causal-mask shape calculation.
+    fn clear_kv_cache(&mut self) {
+        if let Self::Qwen3(m) = self {
+            m.clear_kv_cache();
         }
     }
 }
@@ -126,7 +196,11 @@ fn merge_gguf_shards(paths: &[PathBuf]) -> CoreResult<(gguf_file::Content, Multi
     for (shard_idx, path) in sorted.iter().enumerate() {
         let file_len = std::fs::metadata(path).map_err(CoreError::Io)?.len();
         let mut file = std::fs::File::open(path).map_err(CoreError::Io)?;
-        let content = gguf_file::Content::read(&mut file)?;
+        // Use map_err so an "unknown dtype" candle error (IQ-family quant types
+        // not supported by candle) surfaces as UnsupportedQuantization instead
+        // of the cryptic "Candle error: unknown dtype for tensor N".
+        let content = gguf_file::Content::read(&mut file)
+            .map_err(|e| map_gguf_load_error(e, path.parent().unwrap_or(path)))?;
 
         let tensor_data_start = content.tensor_data_offset;
         let tensor_data_len = file_len - tensor_data_start;
@@ -179,20 +253,54 @@ fn merge_gguf_shards(paths: &[PathBuf]) -> CoreResult<(gguf_file::Content, Multi
 /// Determine which chat template format a model uses.
 ///
 /// The probe order is:
-/// 1. Vocabulary contains `<|im_start|>`  → ChatML  (covers Qwen2, Nanbeige, etc.)
-/// 2. Vocabulary contains `<|eot_id|>`   → LLaMA-3 instruct format
-/// 3. Fall back to architecture string
-fn detect_chat_format(arch: &str, tokenizer: &Tokenizer) -> String {
+/// 1. GGUF `tokenizer.chat_template` contains `<think>` (qwen2/qwen3 arch)
+///    → ChatML-Thinking (Qwen3-Thinking variants)
+/// 2. Vocabulary contains `<think>` as single token (fallback for same case)
+/// 3. Vocabulary contains `<|im_start|>` → ChatML  (covers Qwen2, Nanbeige, etc.)
+/// 4. Vocabulary contains `<|eot_id|>`   → LLaMA-3 instruct format
+/// 5. Vocabulary contains `<|end|>`      → Phi-3 instruct format
+/// 6. Vocabulary contains `<start_of_turn>` → Gemma instruct format
+/// 7. Fall back to architecture string
+fn detect_chat_format(arch: &str, tokenizer: &Tokenizer, chat_template: Option<&str>) -> String {
+    // Primary: inspect the Jinja chat template embedded in GGUF metadata.
+    // This is the canonical detection method used by llama.cpp / ollama:
+    // Qwen3-Thinking models include `<think>` in their assistant turn prefix
+    // (e.g. `<|im_start|>assistant\n<think>\n`), whereas standard Qwen3 and
+    // Qwen2 instruct models do not.
+    // Note: `<think>` is a plain XML-style text marker tokenized as multiple
+    // BPE pieces — it is NOT a single special token, so token_id() cannot
+    // detect it reliably.
+    if matches!(arch, "qwen2" | "qwen3") {
+        if let Some(tmpl) = chat_template {
+            if tmpl.contains("<think>") {
+                return "chatml-thinking".to_string();
+            }
+        }
+        // Secondary fallback: if this model somehow has <think> as a single
+        // vocabulary entry (e.g. a future model or custom tokenizer), honour it.
+        if tokenizer.token_id("<think>").is_some() {
+            return "chatml-thinking".to_string();
+        }
+    }
     if tokenizer.token_id("<|im_start|>").is_some() {
         return "chatml".to_string();
     }
     if tokenizer.token_id("<|eot_id|>").is_some() {
         return "llama3".to_string();
     }
-    match arch {
-        "qwen2" => "chatml",
-        "llama" => "llama2",
-        other => other,
+    if tokenizer.token_id("<|end|>").is_some() {
+        return "phi3".to_string();
+    }
+    if tokenizer.token_id("<start_of_turn>").is_some() {
+        return "gemma".to_string();
+    }
+        match arch {
+        "qwen2" | "qwen3"                      => "chatml",
+        "llama"                                => "llama2",
+        "phi2"                                 => "phi2",
+        "phi3"                                 => "phi3",
+        "gemma" | "gemma2" | "gemma3" | "gemma3n" => "gemma",
+        other                                  => other,
     }
     .to_string()
 }
@@ -299,6 +407,22 @@ fn parse_shard_total(stem: &str) -> Option<usize> {
     digits.parse::<usize>().ok().filter(|&n| n > 1)
 }
 
+// ─── Text stop helpers ────────────────────────────────────────────────────────
+
+/// Check whether `text` contains any of the configured text stop strings.
+///
+/// Returns the byte offset of the first match, or `None` if no match.
+fn find_text_stop(text: &str, stop_strings: &[String]) -> Option<usize> {
+    stop_strings
+        .iter()
+        .filter_map(|s| {
+            if s.is_empty() { None } else { text.find(s.as_str()) }
+        })
+        .min()
+}
+
+// ─── Logit helpers ────────────────────────────────────────────────────────────
+
 /// Extract the logits for a single sequence position from the model output.
 ///
 /// Different candle model implementations return different shapes:
@@ -325,12 +449,28 @@ fn last_token_logits(logits: &Tensor, seq_pos: usize) -> CoreResult<Tensor> {
 impl Model for QuantizedModel {
     fn load(config: &ModelConfig, device: &Device) -> CoreResult<Self> {
         let gguf_paths = Self::find_all_gguf(&config.model_dir)?;
-        info!(
-            paths = ?gguf_paths.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
-            "Loading quantized GGUF model"
-        );
+        let path_names: Vec<String> = gguf_paths
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .collect();
 
-        let (content, mut reader) = merge_gguf_shards(&gguf_paths)?;
+        // Warn early if any shard looks like an Unsloth Dynamic (UD) file.
+        // These mix IQ-family quant types that candle does not support; the
+        // load will fail with a clear UnsupportedQuantization error, but an
+        // upfront warning gives faster feedback in the logs.
+        if path_names.iter().any(|n| n.contains("-UD-")) {
+            tracing::warn!(
+                files = ?path_names,
+                "GGUF file appears to use Unsloth Dynamic (UD) mixed quantization. \
+                 UD files include IQ-family tensor types (IQ4_XS, IQ3_S, …) that \
+                 candle does not support. The load will fail — please download a \
+                 standard quant (Q4_K_M / Q6_K / Q8_0) from the same repository."
+            );
+        }
+
+        info!(paths = ?path_names, "Loading quantized GGUF model");
+
+        let (mut content, mut reader) = merge_gguf_shards(&gguf_paths)?;
 
         // Extract architecture and tokenizer metadata BEFORE content is
         // consumed by from_gguf (which takes ownership of it).
@@ -348,13 +488,70 @@ impl Model for QuantizedModel {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
+        // Extract the Jinja chat template string from GGUF metadata.
+        // This is the canonical way to detect thinking models: Qwen3-Thinking
+        // variants include `<think>` in their template (e.g. the assistant turn
+        // prefix ends with `<|im_start|>assistant\n<think>\n`).
+        // Must be cloned here because `content` is consumed by `from_gguf` below.
+        let chat_template_jinja: Option<String> = match content.metadata.get("tokenizer.chat_template") {
+            Some(gguf_file::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+
         let weights = match arch.as_str() {
             "qwen2" => {
-                let w = quantized_qwen2::ModelWeights::from_gguf(content, &mut reader, device)?;
+                let w = quantized_qwen2::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
                 QuantizedWeights::Qwen2(w)
             }
+            "qwen3" => {
+                let w = quantized_qwen3::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
+                QuantizedWeights::Qwen3(w)
+            }
+            "phi2" => {
+                let w = quantized_phi::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
+                QuantizedWeights::Phi2(w)
+            }
+            "phi3" => {
+                // use_flash_attn = false: flash attention requires a non-default feature flag
+                let w = quantized_phi3::ModelWeights::from_gguf(false, content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
+                QuantizedWeights::Phi3(w)
+            }
+            "gemma" | "gemma2" | "gemma3" => {
+                // quantized_gemma3 probes gemma3/gemma2/gemma metadata keys internally
+                let w = quantized_gemma3::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
+                QuantizedWeights::Gemma(w)
+            }
+            "gemma3n" => {
+                // Gemma 3n stores its GGUF metadata under the "gemma3n.*" prefix
+                // (e.g. "gemma3n.attention.head_count"), while the quantized_gemma3
+                // loader probes for "gemma3.*", "gemma2.*", etc.
+                // The transformer block structure (attention, FFN, norms, tensor
+                // names) is identical to Gemma 3 — only the prefix differs.
+                // We remap every "gemma3n.*" key to a "gemma3.*" alias so the probe
+                // succeeds and the loader reuses the same code path.
+                // Extra gemma3n tensors (per-layer embeddings, vision, audio) are
+                // simply ignored by the text-only loader.
+                let aliases: Vec<(String, gguf_file::Value)> = content
+                    .metadata
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("gemma3n."))
+                    .map(|(k, v)| (k.replacen("gemma3n.", "gemma3.", 1), v.clone()))
+                    .collect();
+                for (k, v) in aliases {
+                    content.metadata.entry(k).or_insert(v);
+                }
+                let w = quantized_gemma3::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
+                QuantizedWeights::Gemma(w)
+            }
             _ => {
-                let w = quantized_llama::ModelWeights::from_gguf(content, &mut reader, device)?;
+                let w = quantized_llama::ModelWeights::from_gguf(content, &mut reader, device)
+                    .map_err(|e| map_gguf_load_error(e, &config.model_dir))?;
                 QuantizedWeights::Llama(w)
             }
         };
@@ -370,7 +567,16 @@ impl Model for QuantizedModel {
             Tokenizer::from_gguf_metadata(&gguf_tokenizer_meta)?
         });
 
-        let chat_format = detect_chat_format(&arch, &tokenizer);
+        // Log whether a chat template was found in GGUF metadata and if it signals thinking.
+        match &chat_template_jinja {
+            Some(t) => info!(
+                has_think_tag = t.contains("<think>"),
+                preview = %&t[..t.len().min(120)],
+                "GGUF tokenizer.chat_template found"
+            ),
+            None => info!("GGUF tokenizer.chat_template not present in metadata"),
+        }
+        let chat_format = detect_chat_format(&arch, &tokenizer, chat_template_jinja.as_deref());
         info!(chat_format = %chat_format, "Detected chat format");
 
         info!("Quantized model loaded successfully");
@@ -406,7 +612,15 @@ impl Model for QuantizedModel {
 
         let (tx, rx) = mpsc::unbounded_channel::<CoreResult<Token>>();
 
+        // Build a HashSet once so every per-token stop-ID check is O(1).
+        let stop_ids: HashSet<u32> = params.stop_token_ids.iter().copied().collect();
+
         let mut token_history = input.token_ids.clone();
+
+        // Clear any append-style KV caches (e.g. Qwen3 ConcatKvCache) so that
+        // stale entries from a previous turn don't widen the KV dimension beyond
+        // what the causal mask expects when offset=0.
+        self.weights.clear_kv_cache();
 
         let input_tensor = Tensor::new(input.token_ids.as_slice(), &self.device)?.unsqueeze(0)?;
         let logits = self.weights.forward(&input_tensor, 0)?;
@@ -415,53 +629,85 @@ impl Model for QuantizedModel {
         let first_id = sample_token(&last_logits, &params, &token_history)?;
         token_history.push(first_id);
 
-        let first_eos = params.stop_token_ids.contains(&first_id);
-
         // Don't send stop tokens to output (synchronous generate)
-        if first_eos {
+        if stop_ids.contains(&first_id) {
             return Ok(rx);
         }
 
         let first_text = self.tokenizer.decode_token(first_id)?;
-        let _ = tx.send(Ok(Token {
-            id: first_id,
-            text: first_text,
-            is_eos: false,
-        }));
 
-        if params.max_new_tokens <= 1 {
-            return Ok(rx);
+        // Collect all tokens first so we can truncate at text stop boundaries
+        // before returning any output to the caller.
+        let mut generated: Vec<(u32, String)> = vec![(first_id, first_text.clone())];
+
+        // think_closed = false  → still inside the <think> block; text stops suppressed.
+        // think_closed = true   → outside the think block (or not a thinking model).
+        // For thinking mode the prompt ends with <think>, so the first generated
+        // token is already inside the block.
+        let mut think_closed = !params.thinking_mode;
+        // Check if the very first decoded token closes the think block.
+        if !think_closed && first_text.contains("</think>") {
+            think_closed = true;
         }
 
-        let mut pos = seq_len;
-        let mut last_id = first_id;
+        if params.max_new_tokens > 1 {
+            let mut pos = seq_len;
+            let mut last_id = first_id;
 
-        for _ in 1..params.max_new_tokens {
-            let step_input = Tensor::new(&[last_id], &self.device)?.unsqueeze(0)?;
-            let step_logits = self.weights.forward(&step_input, pos)?;
-            let step_last = last_token_logits(&step_logits, 0)?;
-            let next_id = sample_token(&step_last, &params, &token_history)?;
+            'gen: for _ in 1..params.max_new_tokens {
+                let step_input = Tensor::new(&[last_id], &self.device)?.unsqueeze(0)?;
+                let step_logits = self.weights.forward(&step_input, pos)?;
+                let step_last = last_token_logits(&step_logits, 0)?;
+                let next_id = sample_token(&step_last, &params, &token_history)?;
 
-            // Cap history to the penalty window to prevent unbounded Vec growth.
-            let cap = params.repeat_last_n.unwrap_or(usize::MAX);
-            if token_history.len() >= cap {
-                token_history.drain(..token_history.len() - cap + 1);
+                // Cap history to the penalty window to prevent unbounded Vec growth.
+                let cap = params.repeat_last_n.unwrap_or(usize::MAX);
+                if token_history.len() >= cap {
+                    token_history.drain(..token_history.len() - cap + 1);
+                }
+                token_history.push(next_id);
+
+                if stop_ids.contains(&next_id) {
+                    break 'gen;
+                }
+
+                let text = self.tokenizer.decode_token(next_id)?;
+
+                // Track think block closure so text stops are only active outside it.
+                if !think_closed && text.contains("</think>") {
+                    think_closed = true;
+                }
+
+                // Check text-based stop strings against the accumulated response,
+                // but only once the think block has been closed.
+                if think_closed && !params.stop_strings.is_empty() {
+                    let accumulated: String = generated.iter().map(|(_, t)| t.as_str()).collect::<String>() + &text;
+                    if let Some(cut) = find_text_stop(&accumulated, &params.stop_strings) {
+                        // Truncate at the stop pattern boundary.
+                        let safe = &accumulated[..cut];
+                        // Re-emit only the safe portion as a single final token.
+                        if !safe.is_empty() {
+                            // Replace the already-collected tokens with a single truncated entry.
+                            generated.clear();
+                            generated.push((next_id, safe.to_string()));
+                        } else {
+                            generated.clear();
+                        }
+                        break 'gen;
+                    }
+                }
+
+                generated.push((next_id, text));
+                last_id = next_id;
+                pos += 1;
             }
-            token_history.push(next_id);
+        }
 
-            let is_eos = params.stop_token_ids.contains(&next_id);
-
-            // Don't send stop tokens to output (synchronous generate)
-            if is_eos {
-                break;
+        // Send all collected tokens to the channel.
+        for (id, text) in generated {
+            if !text.is_empty() {
+                let _ = tx.send(Ok(Token { id, text, is_eos: false }));
             }
-
-            let text = self.tokenizer.decode_token(next_id)?;
-            if tx.send(Ok(Token { id: next_id, text, is_eos: false })).is_err() {
-                break;
-            }
-            last_id = next_id;
-            pos += 1;
         }
 
         Ok(rx)
@@ -488,7 +734,15 @@ impl Model for QuantizedModel {
             });
         }
 
+        // Build a HashSet once so every per-token stop-ID check is O(1).
+        let stop_ids: HashSet<u32> = params.stop_token_ids.iter().copied().collect();
+
         let mut token_history = input.token_ids.clone();
+
+        // Clear any append-style KV caches (e.g. Qwen3 ConcatKvCache) so that
+        // stale entries from a previous turn don't widen the KV dimension beyond
+        // what the causal mask expects when offset=0.
+        self.weights.clear_kv_cache();
 
         let input_tensor = Tensor::new(input.token_ids.as_slice(), &self.device)?.unsqueeze(0)?;
         let logits = self.weights.forward(&input_tensor, 0)?;
@@ -497,16 +751,58 @@ impl Model for QuantizedModel {
         let first_id = sample_token(&last_logits, &params, &token_history)?;
         token_history.push(first_id);
 
-        let first_eos = params.stop_token_ids.contains(&first_id);
-
         // Don't send stop tokens to output
-        if first_eos {
+        if stop_ids.contains(&first_id) {
             return Ok(());
         }
 
         let first_text = self.tokenizer.decode_token(first_id)?;
-        if tx.send(Ok(Token { id: first_id, text: first_text, is_eos: false })).is_err() {
-            return Ok(());
+
+        // Track accumulated text for multi-token text stop detection.
+        // We keep only a rolling suffix of max_stop_len characters to bound memory.
+        let max_stop_len: usize = params.stop_strings.iter().map(|s| s.len()).max().unwrap_or(0) + 64;
+        let mut accumulated = String::new();
+
+        // think_closed = false → inside think block; text stops suppressed.
+        // think_closed = true  → outside (or not a thinking model); stops active.
+        let mut think_closed = !params.thinking_mode;
+        // Check if the first token itself closes the think block.
+        if !think_closed && first_text.contains("</think>") {
+            think_closed = true;
+        }
+
+        // Check the very first token against text stops before sending
+        // (only when outside a think block).
+        let first_safe = if think_closed && !params.stop_strings.is_empty() {
+            accumulated.push_str(&first_text);
+            if let Some(cut) = find_text_stop(&accumulated, &params.stop_strings) {
+                tracing::debug!(
+                    cut,
+                    context = %&accumulated[..cut.min(accumulated.len())],
+                    "Text stop matched on first token"
+                );
+                let safe = accumulated[..cut].to_string();
+                if !safe.is_empty() {
+                    let _ = tx.send(Ok(Token { id: first_id, text: safe, is_eos: false }));
+                }
+                return Ok(());
+            }
+            true
+        } else {
+            true
+        };
+
+        if first_safe {
+            if accumulated.is_empty() { accumulated.push_str(&first_text); }
+            if tx.send(Ok(Token { id: first_id, text: first_text, is_eos: false })).is_err() {
+                return Ok(());
+            }
+        }
+
+        // Trim accumulated buffer to bound its size.
+        if accumulated.len() > max_stop_len {
+            let trim_at = accumulated.len() - max_stop_len;
+            accumulated.drain(..trim_at);
         }
 
         if params.max_new_tokens <= 1 {
@@ -516,7 +812,7 @@ impl Model for QuantizedModel {
         let mut pos = seq_len;
         let mut last_id = first_id;
 
-        for _ in 1..params.max_new_tokens {
+        'gen: for _ in 1..params.max_new_tokens {
             let step_input = Tensor::new(&[last_id], &self.device)?.unsqueeze(0)?;
             let step_logits = self.weights.forward(&step_input, pos)?;
             let step_last = last_token_logits(&step_logits, 0)?;
@@ -529,16 +825,48 @@ impl Model for QuantizedModel {
             }
             token_history.push(next_id);
 
-            let is_eos = params.stop_token_ids.contains(&next_id);
-
-            // Don't send stop tokens to output (streaming generate)
-            if is_eos {
-                break;
+            if stop_ids.contains(&next_id) {
+                break 'gen;
             }
 
             let text = self.tokenizer.decode_token(next_id)?;
+
+            // Track think block closure so text stops are only active outside it.
+            if !think_closed && text.contains("</think>") {
+                think_closed = true;
+            }
+
+            // Text-based stop detection against the rolling suffix buffer,
+            // only applied once the think block has closed.
+            if think_closed && !params.stop_strings.is_empty() {
+                accumulated.push_str(&text);
+                if let Some(cut_in_suffix) = find_text_stop(&accumulated, &params.stop_strings) {
+                    tracing::debug!(
+                        cut = cut_in_suffix,
+                        context = %&accumulated[..cut_in_suffix.min(accumulated.len())],
+                        "Text stop matched during generation"
+                    );
+                    // Compute how many chars of the suffix are safe to emit.
+                    // The safe portion is everything before the stop pattern
+                    // that was NOT yet sent (i.e., the current token's content).
+                    let already_safe_len = accumulated.len() - text.len();
+                    if cut_in_suffix > already_safe_len {
+                        let safe_part = &accumulated[already_safe_len..cut_in_suffix];
+                        if !safe_part.is_empty() {
+                            let _ = tx.send(Ok(Token { id: next_id, text: safe_part.to_string(), is_eos: false }));
+                        }
+                    }
+                    break 'gen;
+                }
+                // Trim the buffer to avoid unbounded growth.
+                if accumulated.len() > max_stop_len {
+                    let trim_at = accumulated.len() - max_stop_len;
+                    accumulated.drain(..trim_at);
+                }
+            }
+
             if tx.send(Ok(Token { id: next_id, text, is_eos: false })).is_err() {
-                break;
+                break 'gen;
             }
             last_id = next_id;
             pos += 1;

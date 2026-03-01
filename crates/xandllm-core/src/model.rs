@@ -44,6 +44,19 @@ pub struct SamplingParams {
     /// value (e.g. 64) to cap O(T) penalty scans on long sequences —
     /// this is the `repeat_last_n` parameter from llama.cpp.
     pub repeat_last_n: Option<usize>,
+    /// Multi-token text-based stop sequences.
+    ///
+    /// When the accumulated response text contains any of these strings,
+    /// generation halts immediately and the matching pattern (and everything
+    /// after it) is excluded from the output.  This catches degenerate
+    /// role-reversal loops (e.g. `"\nUser:"`) that cannot be expressed as a
+    /// single stop token ID.
+    pub stop_strings: Vec<String>,
+    /// When `true`, text stop strings are suppressed until `</think>` is seen
+    /// in the generated output.  Set this for models whose prompt ends with
+    /// `<think>` (e.g. Qwen3-Thinking variants), so that role-reversal stop
+    /// patterns inside the reasoning block do not prematurely halt generation.
+    pub thinking_mode: bool,
 }
 
 impl Default for SamplingParams {
@@ -62,6 +75,8 @@ impl Default for SamplingParams {
             // Default 64: matches llama.cpp's repeat_last_n default.
             // Bounds penalty cost to O(64) regardless of sequence length.
             repeat_last_n: Some(64),
+            stop_strings: vec![],
+            thinking_mode: false,
         }
     }
 }

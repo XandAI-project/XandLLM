@@ -1,13 +1,12 @@
 use axum::{Extension, Json, response::IntoResponse};
 use chrono::Utc;
 use serde_json::json;
-use std::sync::Arc;
 
-use crate::types::{ModelList, ModelObject};
+use crate::{server::ModelId, types::{ModelList, ModelObject}};
 
 /// `GET /v1/models` — list models currently loaded in the server.
 pub async fn list_models(
-    Extension(model_id): Extension<Arc<String>>,
+    Extension(ModelId(model_id)): Extension<ModelId>,
 ) -> Json<ModelList> {
     let now = Utc::now().timestamp();
     Json(ModelList {

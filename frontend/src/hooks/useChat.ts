@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import { streamChat } from "../api";
-import type { Settings } from "../types";
+import type { GenerationStats, Message, Settings, ChatMessage } from "../types";
 
 interface UseChatOptions {
   settings: Settings;
@@ -9,21 +9,13 @@ interface UseChatOptions {
   getApiMessages: (
     conversationId: string,
     systemPrompt: string
-  ) => { role: string; content: string }[];
-  appendMessage: (
-    conversationId: string,
-    msg: {
-      id: string;
-      role: "user" | "assistant";
-      content: string;
-      createdAt: number;
-      streaming?: boolean;
-    }
-  ) => void;
+  ) => ChatMessage[];
+  appendMessage: (conversationId: string, msg: Message) => void;
   updateLastAssistantMessage: (
     conversationId: string,
     content: string,
-    streaming: boolean
+    streaming: boolean,
+    stats?: GenerationStats
   ) => void;
 }
 
@@ -57,8 +49,8 @@ export function useChat({
       // Read history BEFORE appending new messages so we get a clean,
       // up-to-date snapshot of prior turns (no race with setState).
       const history = getApiMessages(conversationId, settings.systemPrompt);
-      const fullMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
-        ...history.map((m) => ({ role: m.role as "system" | "user" | "assistant", content: m.content })),
+      const fullMessages: ChatMessage[] = [
+        ...history,
         { role: "user", content: userText },
       ];
 
@@ -85,6 +77,8 @@ export function useChat({
       setIsStreaming(true);
 
       let accumulated = "";
+      let tokenCount = 0;
+      let startMs = 0;
 
       try {
         for await (const delta of streamChat(
@@ -93,13 +87,27 @@ export function useChat({
           model,
           controller.signal
         )) {
+          if (tokenCount === 0) startMs = Date.now();
+          tokenCount++;
           accumulated += delta;
           updateLastAssistantMessage(conversationId, accumulated, true);
         }
-        updateLastAssistantMessage(conversationId, accumulated, false);
+
+        const elapsedSec = tokenCount > 0 ? (Date.now() - startMs) / 1000 : 0;
+        const stats: GenerationStats = {
+          tokens: tokenCount,
+          tokensPerSec: elapsedSec > 0 ? tokenCount / elapsedSec : 0,
+        };
+
+        updateLastAssistantMessage(conversationId, accumulated, false, stats);
       } catch (err) {
         if ((err as Error).name === "AbortError") {
-          updateLastAssistantMessage(conversationId, accumulated, false);
+          // Show partial stats even on abort
+          const elapsedSec = tokenCount > 0 ? (Date.now() - startMs) / 1000 : 0;
+          const stats: GenerationStats | undefined = tokenCount > 0
+            ? { tokens: tokenCount, tokensPerSec: elapsedSec > 0 ? tokenCount / elapsedSec : 0 }
+            : undefined;
+          updateLastAssistantMessage(conversationId, accumulated, false, stats);
         } else {
           const msg = err instanceof Error ? err.message : String(err);
           setError(msg);

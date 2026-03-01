@@ -1,9 +1,9 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { User, Bot, ChevronDown, ChevronRight, Brain } from "lucide-react";
+import { User, Bot, ChevronDown, ChevronRight, Brain, Zap } from "lucide-react";
 import clsx from "clsx";
-import type { Message as MessageType } from "../types";
+import type { GenerationStats, Message as MessageType } from "../types";
 
 // ── Think-block parser ────────────────────────────────────────────────────────
 
@@ -12,21 +12,31 @@ type Segment =
   | { type: "think"; content: string; closed: boolean };
 
 function parseContent(raw: string): Segment[] {
-  const segments: Segment[] = [];
   const OPEN = "<think>";
   const CLOSE = "</think>";
+
+  if (raw.includes(CLOSE) && !raw.includes(OPEN)) {
+    const closeIdx = raw.indexOf(CLOSE);
+    const result: Segment[] = [];
+    if (closeIdx > 0) {
+      result.push({ type: "think", content: raw.slice(0, closeIdx), closed: true });
+    }
+    const after = raw.slice(closeIdx + CLOSE.length).trimStart();
+    if (after) result.push(...parseContent(after));
+    return result;
+  }
+
+  const segments: Segment[] = [];
   let rest = raw;
 
   while (rest.length > 0) {
     const openIdx = rest.indexOf(OPEN);
 
     if (openIdx === -1) {
-      // No more think tags — remainder is plain text
       if (rest.length > 0) segments.push({ type: "text", content: rest });
       break;
     }
 
-    // Text before the opening tag
     if (openIdx > 0) {
       segments.push({ type: "text", content: rest.slice(0, openIdx) });
     }
@@ -35,12 +45,10 @@ function parseContent(raw: string): Segment[] {
     const closeIdx = afterOpen.indexOf(CLOSE);
 
     if (closeIdx === -1) {
-      // Still inside an open think block (streaming in progress)
       segments.push({ type: "think", content: afterOpen, closed: false });
       break;
     }
 
-    // Fully closed think block
     segments.push({
       type: "think",
       content: afterOpen.slice(0, closeIdx),
@@ -101,7 +109,6 @@ function ThinkBlock({
 
   return (
     <div className="my-2 rounded-lg border border-amber-700/40 bg-amber-950/30 overflow-hidden">
-      {/* Header */}
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -109,7 +116,7 @@ function ThinkBlock({
       >
         {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <Brain size={12} className="flex-shrink-0" />
-        <span>{closed ? "Thinking" : "Thinking…"}</span>
+        <span>{closed ? "Thinking" : "Thinking"}</span>
         {!closed && (
           <span className="ml-auto flex gap-0.5">
             <span className="w-1 h-1 rounded-full bg-amber-400 animate-bounce [animation-delay:0ms]" />
@@ -119,7 +126,6 @@ function ThinkBlock({
         )}
       </button>
 
-      {/* Body */}
       {open && (
         <div className="px-3 pb-3 pt-1 text-xs text-amber-200/70 leading-relaxed border-t border-amber-700/30">
           <div className="prose prose-sm max-w-none text-amber-200/80 [&_*]:text-amber-200/80">
@@ -127,6 +133,19 @@ function ThinkBlock({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Generation stats bar ──────────────────────────────────────────────────────
+
+function StatsBar({ stats }: { stats: GenerationStats }) {
+  return (
+    <div className="flex items-center gap-2 mt-2 pt-2 border-t border-gray-700/50 text-xs text-gray-500 select-none">
+      <Zap size={11} className="flex-shrink-0 text-gray-600" />
+      <span>{stats.tokens} tokens</span>
+      <span className="text-gray-700">·</span>
+      <span>{stats.tokensPerSec.toFixed(1)} tok/s</span>
     </div>
   );
 }
@@ -172,9 +191,9 @@ export default function Message({ message, showThink }: Props) {
         {isUser ? (
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
         ) : (
-          <div>
+          <div className="space-y-2">
             {/* Thinking segments */}
-            {hasThink &&
+            {hasThink && showThink &&
               segments!.map((seg, i) => {
                 if (seg.type === "think") {
                   return (
@@ -182,14 +201,14 @@ export default function Message({ message, showThink }: Props) {
                       key={i}
                       content={seg.content}
                       closed={seg.closed}
-                      defaultOpen={showThink}
+                      defaultOpen={true}
                     />
                   );
                 }
                 return null;
               })}
 
-            {/* Text segments — rendered as markdown */}
+            {/* Text segments */}
             <div
               className={clsx(
                 "prose prose-invert prose-sm max-w-none",
@@ -203,14 +222,17 @@ export default function Message({ message, showThink }: Props) {
                   ) : null
                 )
               ) : (
-                // No text segments yet (still thinking or empty)
                 message.streaming ? null : (
                   <MarkdownContent content={message.content} />
                 )
               )}
-              {/* Streaming cursor after last text when still generating */}
               {message.streaming && <span className="streaming-cursor" />}
             </div>
+
+            {/* Generation stats */}
+            {!message.streaming && message.stats && (
+              <StatsBar stats={message.stats} />
+            )}
           </div>
         )}
       </div>

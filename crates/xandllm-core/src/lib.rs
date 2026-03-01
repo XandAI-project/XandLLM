@@ -22,6 +22,7 @@
 pub mod chat_template;
 pub mod device;
 pub mod error;
+pub mod gguf_engine;
 pub mod kv_cache;
 pub mod llama;
 pub mod loader;
@@ -32,6 +33,7 @@ pub mod tokenizer;
 
 pub use device::select_device;
 pub use error::{CoreError, CoreResult};
+pub use gguf_engine::GgufEngine;
 pub use llama::LlamaModel;
 pub use loader::AnyModel;
 pub use model::{GenerateInput, Model, ModelConfig, SamplingParams, Token};

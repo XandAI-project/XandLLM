@@ -24,33 +24,55 @@ XandLLM currently supports the following model architectures and formats:
 |---|---|---|---|
 | **LLaMA** | Safetensors / GGUF | LLaMA, LLaMA-2, LLaMA-3, Mistral, CodeLlama | `llama2`, `llama3` |
 | **Qwen2** | GGUF | Qwen2, Qwen2.5, Qwen2.5-Coder | `chatml` |
+| **Qwen3** | GGUF | Qwen3, Qwen3-Thinking (reasoning) | `chatml`, `chatml-thinking` |
+| **Gemma3** | GGUF | Gemma 3 (all sizes, IT variants) | `gemma` |
+| **Phi-3** | GGUF | Phi-3 Mini, Phi-3 Medium | `phi3` |
 | **ChatML-compatible** | GGUF | Nanbeige, DeepSeek, and other ChatML models | `chatml` |
 
 ### Model Formats
 
-- **GGUF** (quantized) — Q4_0, Q8_0, and other quantization levels
+- **GGUF** (quantized) — Q4_0, Q4_K_M, Q6_K, Q8_0, and all other quantization levels
 - **Safetensors** (full precision) — LLaMA-family models
 
 ### Chat Templates
 
-- **ChatML** (`chatml`) — Qwen2, Nanbeige, DeepSeek, and other instruction-tuned models
+- **ChatML** (`chatml`) — Qwen2, Qwen3, Nanbeige, DeepSeek, and other instruction-tuned models
+- **ChatML-Thinking** (`chatml-thinking`) — Qwen3-Thinking variants with `<think>` reasoning blocks
 - **LLaMA-2** (`llama2`) — `[INST]` format for LLaMA-2 and compatible models
 - **LLaMA-3** (`llama3`) — Header-based format for LLaMA-3 instruct models
+- **Gemma** (`gemma`) — `<start_of_turn>` / `<end_of_turn>` format for Gemma 1/2/3
+- **Phi-3** (`phi3`) — `<|user|>` / `<|assistant|>` / `<|end|>` format
 
 Chat template detection is automatic based on vocabulary probing, ensuring correct formatting even when the architecture tag doesn't match the template (e.g., Nanbeige reports `"llama"` but uses ChatML).
 
 ### Example Models
 
 ```bash
-# Qwen2 models
+# Qwen2 / Qwen3
 xandllm pull Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_0
+xandllm pull TeichAI/Qwen3-4B-Thinking-2507-Claude-4.5-Opus-High-Reasoning-Distill-GGUF
 
-# LLaMA-3 models
+# Gemma 3
+xandllm pull unsloth/gemma-3-4b-it-GGUF:Q6_K
+
+# LLaMA-3
 xandllm pull meta-llama/Llama-3.1-8B-Instruct
 
-# ChatML-compatible models
+# ChatML-compatible
 xandllm pull tantk/Nanbeige4.1-3B-GGUF
 ```
+
+---
+
+## Tested Models
+
+The following models have been verified to load and generate correctly with XandLLM:
+
+| Model | Revision | Architecture | Chat Template | Notes |
+|---|---|---|---|---|
+| [Qwen/Qwen2.5-Coder-7B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF) | main | qwen2 | `chatml` | Code generation; multi-quant repo, specify e.g. `:Q4_0` |
+| [TeichAI/Qwen3-4B-Thinking-2507-Claude-4.5-Opus-High-Reasoning-Distill-GGUF](https://huggingface.co/TeichAI/Qwen3-4B-Thinking-2507-Claude-4.5-Opus-High-Reasoning-Distill-GGUF) | main | qwen3 | `chatml-thinking` | Reasoning model; `<think>` blocks rendered in UI |
+| [unsloth/gemma-3-4b-it-GGUF](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF) | main | gemma3 | `gemma` | Instruction-tuned Gemma 3 4B; specify e.g. `:Q6_K` |
 
 ---
 
@@ -417,7 +439,7 @@ xandllm/
 ### Additional Architectures
 
 - [ ] **Phi** (Microsoft) — compact language models
-- [ ] **Gemma** (Google) — open Gemma models
+- [x] **Gemma** (Google) — Gemma 3 (all IT sizes) via GGUF
 - [ ] **Falcon** — TII Falcon models
 - [ ] **Mamba** — state-space models (SSM)
 - [ ] **RWKV** — recurrent neural network architecture

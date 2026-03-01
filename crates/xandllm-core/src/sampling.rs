@@ -1,20 +1,25 @@
 use candle_core::{DType, Tensor};
-use std::collections::HashMap;
 
 use crate::error::CoreResult;
 use crate::model::SamplingParams;
 
 /// Sample the next token id from logits.
 ///
-/// Applies various penalties and filters in the following order:
-/// 1. Repetition penalty (based on token history)
-/// 2. Frequency/presence penalties (OpenAI-style)
-/// 3. Top-K filtering
-/// 4. Temperature scaling
-/// 5. Top-P (nucleus) filtering
-/// 6. Multinomial sampling (with optional seeded RNG)
+/// ## Pipeline (non-greedy)
 ///
-/// `token_history` should include all tokens generated so far (including prompt tokens).
+/// 1. Temperature scaling on GPU (scalar division — no data movement).
+/// 2. **Single** GPU→CPU transfer (`to_vec1`).  This is the only CUDA
+///    synchronization point in the non-greedy path.
+/// 3. Repetition / frequency / presence penalties applied in-place on the
+///    CPU vector — sparse, O(|history|) not O(vocab_size).
+/// 4. Top-K mask applied on the CPU vector (partial sort, O(n) average).
+/// 5. Softmax + top-P nucleus + multinomial sample — all on CPU, single pass.
+///
+/// The previous implementation ran two separate `to_vec1()` calls (one inside
+/// `top_p_filter` and one inside `multinomial_sample`), causing two CUDA
+/// synchronisation stalls, two 1 MB D2H transfers, and one 1 MB H2D mask
+/// upload per generated token.  With Gemma 3's 256 k vocabulary this was a
+/// dominant bottleneck.
 pub fn sample_token(
     logits: &Tensor,
     params: &SamplingParams,
@@ -24,223 +29,227 @@ pub fn sample_token(
         return greedy(logits);
     }
 
-    // Apply the repeat_last_n window — cap how far back penalty scans go.
-    // This bounds penalty computation to O(window) instead of O(T) and
-    // prevents unbounded token_history from consuming growing memory,
-    // matching llama.cpp's `repeat_last_n` semantics.
+    // ── GPU phase ─────────────────────────────────────────────────────────────
+    // Temperature is a scalar division; keep it on the GPU so the model's
+    // cached logits are scaled before we pull data across PCIe.
+    let scaled = apply_temperature_gpu(logits, params.temperature)?;
+
+    // Single GPU→CPU transfer — everything from here is pure CPU.
+    let mut logits_vec: Vec<f32> = scaled.to_dtype(DType::F32)?.to_vec1()?;
+
+    // ── CPU phase ─────────────────────────────────────────────────────────────
     let penalty_window: &[u32] = match params.repeat_last_n {
-        Some(n) if n < token_history.len() => {
-            &token_history[token_history.len() - n..]
-        }
+        Some(n) if n < token_history.len() => &token_history[token_history.len() - n..],
         _ => token_history,
     };
 
-    let mut logits = logits.clone();
-
-    // Apply repetition penalty
+    // Penalties — in-place, sparse (only iterate tokens that appeared).
     if (params.repetition_penalty - 1.0).abs() > f64::EPSILON {
-        logits = apply_repetition_penalty(&logits, penalty_window, params.repetition_penalty)?;
+        apply_repetition_penalty_cpu(&mut logits_vec, penalty_window, params.repetition_penalty);
     }
-
-    // Apply frequency and presence penalties
     if params.frequency_penalty.abs() > f64::EPSILON || params.presence_penalty.abs() > f64::EPSILON {
-        logits = apply_frequency_presence_penalty(
-            &logits,
+        apply_frequency_presence_penalty_cpu(
+            &mut logits_vec,
             penalty_window,
             params.frequency_penalty,
             params.presence_penalty,
-        )?;
+        );
     }
 
-    // Apply top-k filter
+    // Top-K: zero out all but the top-k logits in-place.
     if let Some(k) = params.top_k {
-        logits = top_k_filter(&logits, k)?;
+        top_k_filter_cpu(&mut logits_vec, k);
     }
 
-    // Apply temperature
-    logits = apply_temperature(&logits, params.temperature)?;
-
-    // Apply top-p filter
-    logits = top_p_filter(&logits, params.top_p)?;
-
-    // Sample with optional seed
-    multinomial_sample(&logits, params.seed)
+    // Top-P + multinomial: single pass over the CPU vector.
+    sample_top_p_cpu(&logits_vec, params.top_p, params.seed)
 }
 
-/// Greedy decoding: return the token with the highest logit.
+// ─── GPU helpers (temperature only) ──────────────────────────────────────────
+
+/// Greedy decoding: argmax on GPU, single scalar D2H transfer.
 fn greedy(logits: &Tensor) -> CoreResult<u32> {
-    let id = logits
-        .argmax(candle_core::D::Minus1)?
-        .to_scalar::<u32>()?;
+    let id = logits.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
     Ok(id)
 }
 
-/// Divide logits by temperature. A temperature of 0 is treated as greedy.
-fn apply_temperature(logits: &Tensor, temperature: f64) -> CoreResult<Tensor> {
-    if temperature <= 0.0 || temperature == 1.0 {
+/// Scale logits by 1/temperature.  Returns a clone if temperature is 1.0 or
+/// non-positive (treated as no scaling / greedy-like).
+fn apply_temperature_gpu(logits: &Tensor, temperature: f64) -> CoreResult<Tensor> {
+    if temperature <= 0.0 || (temperature - 1.0).abs() < f64::EPSILON {
         return Ok(logits.clone());
     }
     Ok((logits / temperature)?)
 }
 
-/// Apply repetition penalty to discourage repeating tokens.
-///
-/// For each token that appears in `token_history`, divide its logit by `penalty`.
-/// A penalty > 1.0 makes repeated tokens less likely.
-/// 
-/// GPU-optimized: builds mask on CPU, performs division on GPU (no GPU→CPU transfer).
-fn apply_repetition_penalty(
-    logits: &Tensor,
-    token_history: &[u32],
-    penalty: f64,
-) -> CoreResult<Tensor> {
-    if penalty <= 0.0 || (penalty - 1.0).abs() < f64::EPSILON {
-        return Ok(logits.clone());
-    }
+// ─── CPU in-place helpers ─────────────────────────────────────────────────────
 
-    let vocab_size = logits.dims1()?;
-    let mut penalty_mask = vec![1.0f32; vocab_size];
-    
-    for &token_id in token_history {
-        let idx = token_id as usize;
-        if idx < vocab_size {
-            penalty_mask[idx] = penalty as f32;
+/// Divide each token's logit that appears in `history` by `penalty`.
+///
+/// Operates directly on the already-transferred `Vec<f32>` — no GPU tensor
+/// allocations, no H2D uploads, O(|history|) not O(vocab_size).
+fn apply_repetition_penalty_cpu(logits: &mut [f32], history: &[u32], penalty: f64) {
+    if penalty <= 0.0 || (penalty - 1.0).abs() < f64::EPSILON {
+        return;
+    }
+    let p = penalty as f32;
+    let vocab = logits.len();
+    for &id in history {
+        let idx = id as usize;
+        if idx < vocab {
+            // Standard repetition penalty: divide positive logits, multiply
+            // negative logits, so both are pushed toward 0 (less likely).
+            if logits[idx] >= 0.0 {
+                logits[idx] /= p;
+            } else {
+                logits[idx] *= p;
+            }
         }
     }
-
-    let mask = Tensor::from_vec(penalty_mask, vocab_size, logits.device())?;
-    Ok((logits / mask)?)
 }
 
-/// Apply OpenAI-style frequency and presence penalties.
+/// Subtract frequency and presence penalties in-place.
 ///
-/// - Frequency penalty: scales with how many times a token has appeared
-/// - Presence penalty: binary (0 or 1 appearance)
-/// 
-/// GPU-optimized: builds penalty vector on CPU, performs subtraction on GPU.
-fn apply_frequency_presence_penalty(
-    logits: &Tensor,
-    token_history: &[u32],
+/// O(|history|) — builds counts only for tokens in history, never touches the
+/// rest of the vocabulary.
+fn apply_frequency_presence_penalty_cpu(
+    logits: &mut [f32],
+    history: &[u32],
     frequency_penalty: f64,
     presence_penalty: f64,
-) -> CoreResult<Tensor> {
-    let vocab_size = logits.dims1()?;
-    let mut penalty_vec = vec![0.0f32; vocab_size];
-    
-    let mut token_counts: HashMap<u32, usize> = HashMap::new();
-    for &token_id in token_history {
-        *token_counts.entry(token_id).or_insert(0) += 1;
+) {
+    let vocab = logits.len();
+    // Accumulate per-token counts using a small stack-friendly scan.
+    // For typical histories (< 4096 tokens) this is fast with no allocation
+    // beyond the HashMap itself.
+    let mut counts: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::with_capacity(history.len().min(512));
+    for &id in history {
+        *counts.entry(id).or_insert(0) += 1;
     }
-
-    for (&token_id, &count) in &token_counts {
-        let idx = token_id as usize;
-        if idx < vocab_size {
-            let freq = frequency_penalty * count as f64;
-            let pres = if count > 0 { presence_penalty } else { 0.0 };
-            penalty_vec[idx] = (freq + pres) as f32;
+    for (id, count) in counts {
+        let idx = id as usize;
+        if idx < vocab {
+            let penalty =
+                (frequency_penalty * count as f64 + presence_penalty) as f32;
+            logits[idx] -= penalty;
         }
     }
-
-    let penalty_tensor = Tensor::from_vec(penalty_vec, vocab_size, logits.device())?;
-    Ok((logits - penalty_tensor)?)
 }
 
-/// Keep only the top K logits, zero out the rest.
-/// 
-/// GPU-optimized: single transfer for sorting, uses partial sort for O(n) instead of O(n log n).
-fn top_k_filter(logits: &Tensor, k: usize) -> CoreResult<Tensor> {
-    if k == 0 {
-        return Ok(logits.clone());
+/// Keep only the top-`k` logits; set all others to `-∞`.
+///
+/// Uses a partial sort (O(n) average) so we don't pay O(n log n) for sorting
+/// the full vocabulary just to zero-mask most of it.
+fn top_k_filter_cpu(logits: &mut Vec<f32>, k: usize) {
+    if k == 0 || k >= logits.len() {
+        return;
     }
-
-    let vocab_size = logits.dims1()?;
-    
-    if k >= vocab_size {
-        return Ok(logits.clone());
-    }
-
-    let logits_vec: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec1()?;
-    let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
-    
-    // Partial sort: O(n) average case instead of O(n log n) full sort
+    // Build indexed pairs, partial-sort to find the k-th largest threshold.
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    let mut mask = vec![f32::NEG_INFINITY; vocab_size];
-    for (idx, _) in indexed.iter().take(k) {
-        mask[*idx] = 0.0;
+    // The threshold is the value at position k (first element outside top-k).
+    let threshold = indexed[k].1;
+    for v in logits.iter_mut() {
+        if *v < threshold {
+            *v = f32::NEG_INFINITY;
+        }
     }
-
-    let mask_tensor = Tensor::from_vec(mask, vocab_size, logits.device())?;
-    Ok((logits + mask_tensor)?)
 }
 
-/// Zero out logits outside the top-p nucleus.
-/// 
-/// Optimized: single GPU→CPU transfer (for sorting/cumsum), mask creation on GPU.
-fn top_p_filter(logits: &Tensor, top_p: f64) -> CoreResult<Tensor> {
-    if top_p >= 1.0 {
-        return Ok(logits.clone());
-    }
+/// Softmax → top-P nucleus filter → multinomial sample — entirely on CPU.
+///
+/// Combines what was previously `top_p_filter` (GPU softmax + D2H + H2D) and
+/// `multinomial_sample` (second GPU softmax + D2H) into a single CPU pass with
+/// zero GPU involvement.
+fn sample_top_p_cpu(logits: &[f32], top_p: f64, seed: Option<u64>) -> CoreResult<u32> {
+    let n = logits.len();
 
-    // Softmax on GPU, then single transfer for sorting
-    let probs = candle_nn::ops::softmax(logits, candle_core::D::Minus1)?;
-    let probs_vec: Vec<f32> = probs.to_dtype(DType::F32)?.to_vec1()?;
-
-    let vocab_size = probs_vec.len();
-
-    // Sort indices by descending probability
-    let mut indexed: Vec<(usize, f32)> = probs_vec.iter().copied().enumerate().collect();
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    // Find the cutoff index
-    let mut cumsum = 0.0f32;
-    let mut cutoff = vocab_size;
-    for (i, (_, p)) in indexed.iter().enumerate() {
-        cumsum += p;
-        if cumsum as f64 >= top_p {
-            cutoff = i + 1;
-            break;
+    // ── Softmax (numerically stable, CPU) ────────────────────────────────────
+    let max_logit = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&v| (v - max_logit).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        for p in probs.iter_mut() {
+            *p /= sum;
         }
     }
 
-    // Build mask: keep only the top-p tokens
-    let mut mask = vec![f32::NEG_INFINITY; vocab_size];
-    for (idx, _) in indexed.iter().take(cutoff) {
-        mask[*idx] = 0.0;
+    // ── Top-P nucleus filter ──────────────────────────────────────────────────
+    // Only applied when top_p < 1.0; otherwise sample directly from the full
+    // distribution.
+    if top_p < 1.0 {
+        // Sort indices by descending probability to find the nucleus.
+        let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let mut cumsum = 0.0f32;
+        let mut nucleus_end = n;
+        for (i, (_, p)) in indexed.iter().enumerate() {
+            cumsum += p;
+            if cumsum as f64 >= top_p {
+                nucleus_end = i + 1;
+                break;
+            }
+        }
+
+        // Zero out probabilities outside the nucleus.
+        let mut keep = vec![false; n];
+        for (idx, _) in indexed.iter().take(nucleus_end) {
+            keep[*idx] = true;
+        }
+        let mut new_sum = 0.0f32;
+        for (i, p) in probs.iter_mut().enumerate() {
+            if !keep[i] {
+                *p = 0.0;
+            } else {
+                new_sum += *p;
+            }
+        }
+        // Re-normalise the nucleus so the CDF reaches exactly 1.0.
+        if new_sum > 0.0 {
+            for p in probs.iter_mut() {
+                *p /= new_sum;
+            }
+        }
     }
 
-    let mask_tensor = Tensor::from_vec(mask, vocab_size, logits.device())?;
-    Ok((logits + mask_tensor)?)
-}
-
-/// Draw a sample from the (possibly filtered) logit distribution.
-/// 
-/// This is the only mandatory GPU→CPU transfer in the sampling pipeline
-/// (random number comparison must happen on CPU).
-fn multinomial_sample(logits: &Tensor, seed: Option<u64>) -> CoreResult<u32> {
-    let probs = candle_nn::ops::softmax(logits, candle_core::D::Minus1)?;
-    let probs_vec: Vec<f32> = probs.to_dtype(DType::F32)?.to_vec1()?;
-
-    let sample: f32 = if let Some(s) = seed {
+    // ── Multinomial sample ────────────────────────────────────────────────────
+    let r: f32 = if let Some(s) = seed {
         seeded_rand_f32(s)
     } else {
         rand_f32()
     };
 
     let mut cumsum = 0.0f32;
-    for (i, &p) in probs_vec.iter().enumerate() {
+    for (i, &p) in probs.iter().enumerate() {
         cumsum += p;
-        if sample <= cumsum {
+        if r <= cumsum {
             return Ok(i as u32);
         }
     }
-    // Fallback to last token (rounding errors)
-    Ok((probs_vec.len() - 1) as u32)
+    // Fallback: rounding errors — return the last non-zero probability token.
+    Ok(probs
+        .iter()
+        .enumerate()
+        .rfind(|(_, &p)| p > 0.0)
+        .map(|(i, _)| i as u32)
+        .unwrap_or((n - 1) as u32))
 }
 
-/// Simple LCG-based pseudo-random float in [0, 1).
+// ─── RNG helpers ──────────────────────────────────────────────────────────────
+
+/// Generate a pseudo-random float in [0, 1) seeded from wall-clock nanoseconds.
 ///
-/// Using a lightweight inline RNG avoids pulling in an extra dependency.
+/// Uses a single LCG step — intentionally lightweight; the quality is
+/// sufficient for sampling and avoids pulling in an external RNG dependency.
 fn rand_f32() -> f32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
@@ -269,7 +278,6 @@ mod tests {
 
     #[test]
     fn test_greedy_picks_argmax() {
-        // Index 3 has the highest value — greedy must pick it
         let logits = cpu_logits(&[0.1, 0.2, 0.3, 5.0, 0.1]);
         let params = SamplingParams { greedy: true, ..Default::default() };
         let id = sample_token(&logits, &params, &[]).unwrap();
@@ -285,7 +293,6 @@ mod tests {
 
     #[test]
     fn test_top_p_full_does_not_panic() {
-        // top_p = 1.0 means no filtering; sampling should succeed on uniform logits
         let logits = cpu_logits(&[1.0f32; 20]);
         let params = SamplingParams {
             greedy: false,
@@ -299,7 +306,8 @@ mod tests {
 
     #[test]
     fn test_top_p_narrow_selects_from_top() {
-        // Only indices 4 (logit=100) should survive top_p=0.9
+        // Index 4 has logit=100, everything else is 0. After softmax index 4
+        // has probability ~1.0, so top_p=0.9 must select it.
         let mut values = vec![0.0f32; 10];
         values[4] = 100.0;
         let logits = cpu_logits(&values);
@@ -315,7 +323,6 @@ mod tests {
 
     #[test]
     fn test_temperature_passthrough_at_one() {
-        // temperature == 1.0 is a passthrough; greedy result must stay the same
         let logits = cpu_logits(&[0.1, 0.1, 10.0, 0.1]);
         let params = SamplingParams {
             greedy: true,
@@ -323,5 +330,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sample_token(&logits, &params, &[]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_repetition_penalty_cpu_reduces_seen_token() {
+        // Seen token is index 0 (logit=5.0); penalty=2.0 should halve it.
+        let mut logits = vec![5.0f32, 1.0, 1.0];
+        apply_repetition_penalty_cpu(&mut logits, &[0u32], 2.0);
+        assert!((logits[0] - 2.5).abs() < 1e-5, "Positive logit must be divided by penalty");
+        assert!((logits[1] - 1.0).abs() < 1e-5, "Unseen token must be unchanged");
+    }
+
+    #[test]
+    fn test_repetition_penalty_cpu_negative_logit() {
+        // Negative logits should be multiplied by the penalty (pushed lower).
+        let mut logits = vec![-2.0f32, 1.0];
+        apply_repetition_penalty_cpu(&mut logits, &[0u32], 2.0);
+        assert!((logits[0] - (-4.0)).abs() < 1e-5, "Negative logit must be multiplied by penalty");
+    }
+
+    #[test]
+    fn test_top_k_filter_cpu_keeps_k_largest() {
+        let mut logits = vec![1.0f32, 5.0, 3.0, 2.0, 4.0];
+        top_k_filter_cpu(&mut logits, 2);
+        // The two largest are indices 1 (5.0) and 4 (4.0); the rest become -∞.
+        assert!(logits[1].is_finite(), "Top-1 must be kept");
+        assert!(logits[4].is_finite(), "Top-2 must be kept");
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_sample_top_p_cpu_deterministic_with_seed() {
+        let logits = vec![1.0f32; 10];
+        let a = sample_top_p_cpu(&logits, 1.0, Some(42)).unwrap();
+        let b = sample_top_p_cpu(&logits, 1.0, Some(42)).unwrap();
+        assert_eq!(a, b, "Same seed must produce same token");
+    }
+
+    #[test]
+    fn test_sample_top_p_cpu_dominated_distribution() {
+        // Index 7 has a massively higher logit; top_p=0.95 must select it.
+        let mut logits = vec![0.0f32; 20];
+        logits[7] = 50.0;
+        let id = sample_top_p_cpu(&logits, 0.95, None).unwrap();
+        assert_eq!(id, 7);
     }
 }

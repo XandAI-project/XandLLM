@@ -132,7 +132,7 @@ export default function SettingsModal({ settings, onSave, onClose }: Props) {
             <div>
               <p className="text-sm font-medium text-gray-300">Show thinking by default</p>
               <p className="text-xs text-gray-500 mt-0.5">
-                Display {"<think>"} reasoning blocks in assistant responses.
+                Display thinking blocks in assistant responses.
               </p>
             </div>
             <button

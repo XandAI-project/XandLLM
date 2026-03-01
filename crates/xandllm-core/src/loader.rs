@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     error::{CoreError, CoreResult},
+    gguf_engine::GgufEngine,
     llama::LlamaModel,
     model::{GenerateInput, Model, ModelConfig, SamplingParams, Token},
     quantized::QuantizedModel,
@@ -15,12 +16,15 @@ use crate::{
 /// and loads the appropriate backend.
 ///
 /// Decision rules (checked in order):
-/// 1. If any `.gguf` file is present → `QuantizedModel`
-/// 2. If `model.safetensors` or `model.safetensors.index.json` is present → `LlamaModel`
-/// 3. Error
+/// 1. If any `.gguf` file is present and `cuda_engine` feature is active → `GgufEngine`
+/// 2. If any `.gguf` file is present (no `cuda_engine`) → `QuantizedModel`
+/// 3. If `model.safetensors` or `model.safetensors.index.json` is present → `LlamaModel`
+/// 4. Error
 pub enum AnyModel {
     Llama(LlamaModel),
     Quantized(QuantizedModel),
+    /// Custom C/CUDA Gemma 3 engine (only available with `cuda_engine` feature).
+    GgufEngine(GgufEngine),
 }
 
 impl AnyModel {
@@ -32,28 +36,30 @@ impl AnyModel {
         match self {
             AnyModel::Llama(m) => m.tokenizer_arc(),
             AnyModel::Quantized(m) => m.tokenizer_arc(),
+            AnyModel::GgufEngine(m) => m.tokenizer_arc(),
         }
     }
 
-    /// Architecture identifier string (e.g. `"qwen2"`, `"llama"`).
+    /// Architecture identifier string (e.g. `"qwen2"`, `"llama"`, `"gemma3"`).
     pub fn architecture(&self) -> &str {
         match self {
             AnyModel::Llama(m) => m.architecture(),
             AnyModel::Quantized(m) => m.architecture(),
+            AnyModel::GgufEngine(m) => m.architecture(),
         }
     }
 
     /// Chat template format to use for this model (e.g. `"chatml"`,
-    /// `"llama2"`, `"llama3"`).
+    /// `"llama2"`, `"llama3"`, `"gemma"`).
     ///
     /// This is determined at load time by probing the vocabulary for
     /// well-known special tokens, so it is reliable even for models whose
-    /// GGUF architecture tag does not match their template (e.g. Nanbeige
-    /// reports `"llama"` but uses ChatML).
+    /// GGUF architecture tag does not match their template.
     pub fn chat_format(&self) -> &str {
         match self {
             AnyModel::Llama(m) => m.chat_format(),
             AnyModel::Quantized(m) => m.chat_format(),
+            AnyModel::GgufEngine(m) => m.chat_format(),
         }
     }
 }
@@ -63,6 +69,7 @@ impl std::fmt::Debug for AnyModel {
         match self {
             AnyModel::Llama(_) => write!(f, "AnyModel::Llama"),
             AnyModel::Quantized(_) => write!(f, "AnyModel::Quantized"),
+            AnyModel::GgufEngine(_) => write!(f, "AnyModel::GgufEngine"),
         }
     }
 }
@@ -83,6 +90,14 @@ impl Model for AnyModel {
             .unwrap_or(false);
 
         if has_gguf {
+            // When the cuda_engine feature is active, use the custom C/CUDA engine
+            // for GGUF models (Gemma 3).  Otherwise fall back to the candle-based
+            // QuantizedModel for all supported GGUF architectures.
+            #[cfg(feature = "cuda_engine")]
+            {
+                return GgufEngine::load(config, device).map(AnyModel::GgufEngine);
+            }
+            #[cfg(not(feature = "cuda_engine"))]
             return QuantizedModel::load(config, device).map(AnyModel::Quantized);
         }
 
@@ -110,6 +125,7 @@ impl Model for AnyModel {
         match self {
             AnyModel::Llama(m) => m.generate(input, params),
             AnyModel::Quantized(m) => m.generate(input, params),
+            AnyModel::GgufEngine(m) => m.generate(input, params),
         }
     }
 
@@ -122,6 +138,7 @@ impl Model for AnyModel {
         match self {
             AnyModel::Llama(m) => m.generate_stream(input, params, tx),
             AnyModel::Quantized(m) => m.generate_stream(input, params, tx),
+            AnyModel::GgufEngine(m) => m.generate_stream(input, params, tx),
         }
     }
 }

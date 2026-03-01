@@ -142,7 +142,7 @@ export default function ChatPane({
     <div className="flex flex-col flex-1 h-full min-w-0">
       {/* Top bar */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-gray-800 bg-gray-950">
-        <h1 className="text-sm font-medium text-gray-200 truncate">
+        <h1 className="text-sm font-medium text-gray-200 truncate pr-24">
           {conversation?.title ?? "XandLLM Chat"}
         </h1>
         <ModelBadge status={serverStatus} />
@@ -240,10 +240,16 @@ export default function ChatPane({
               integer
               onChange={(v) => onSettingChange("maxTokens", v)}
             />
-            {/* Show-think toggle */}
+            {/* Reasoning visibility toggle.
+                ON  = reasoning block is rendered and expanded.
+                OFF = reasoning block is hidden entirely; only the final
+                      answer is shown.  Does not affect whether the model
+                      reasons — that is controlled server-side. */}
             <button
               type="button"
-              title={settings.showThink ? "Hide thinking" : "Show thinking"}
+              title={settings.showThink
+                ? "Reasoning is visible — click to hide"
+                : "Reasoning is hidden — click to show"}
               onClick={() => onSettingChange("showThink", !settings.showThink)}
               className={clsx(
                 "flex items-center gap-1 px-2 py-1 rounded-md text-xs transition-colors",
@@ -253,7 +259,7 @@ export default function ChatPane({
               )}
             >
               <Brain size={11} />
-              {settings.showThink ? "Think: on" : "Think: off"}
+              {settings.showThink ? "Reasoning: on" : "Reasoning: off"}
             </button>
           </div>
 

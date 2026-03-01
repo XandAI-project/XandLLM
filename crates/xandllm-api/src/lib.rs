@@ -21,5 +21,5 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use server::{serve, build_router, ServerConfig};
+pub use server::{serve, build_router, ServerConfig, ModelId, ChatFormat};
 pub use error::{ApiError, ApiResult};

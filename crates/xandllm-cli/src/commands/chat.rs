@@ -62,7 +62,7 @@ pub async fn run(
     // For non-ChatML formats, include the native EOS token so base/llama2/llama3
     // models still terminate naturally. ChatML models deliberately exclude </s>
     // because it appears mid-stream inside <think> blocks.
-    if !matches!(chat_fmt.as_str(), "chatml" | "qwen2") {
+    if !matches!(chat_fmt.as_str(), "chatml" | "qwen2" | "qwen3" | "chatml-thinking") {
         if let Some(eos) = tokenizer.eos_token_id() {
             if !stop_token_ids.contains(&eos) {
                 stop_token_ids.push(eos);
@@ -132,6 +132,11 @@ pub async fn run(
 
         let input = GenerateInput { token_ids };
 
+        let stop_strings: Vec<String> = xandllm_core::chat_template::stop_text_strings_for_format(&chat_fmt)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
         let params = SamplingParams {
             max_new_tokens: max_tokens.unwrap_or(config.inference.default_max_new_tokens),
             temperature: temperature.unwrap_or(config.inference.temperature),
@@ -144,6 +149,8 @@ pub async fn run(
             greedy: false,
             stop_token_ids: stop_token_ids.clone(),
             repeat_last_n: Some(64),
+            stop_strings,
+            thinking_mode: chat_fmt == "chatml-thinking",
         };
 
         // ── Stream the response ───────────────────────────────────────────

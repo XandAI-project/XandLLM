@@ -1,5 +1,20 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+/// Newtype wrapper for the loaded model's repository identifier.
+///
+/// Using a distinct type instead of bare `Arc<String>` prevents Axum's
+/// type-based Extension lookup from colliding with other `Arc<String>`
+/// extensions (specifically `ChatFormat`).
+#[derive(Debug, Clone)]
+pub struct ModelId(pub Arc<String>);
+
+/// Newtype wrapper for the detected chat template format string (e.g. `"gemma"`, `"chatml"`).
+///
+/// Same motivation as `ModelId` — keeps the Axum Extension type unique so
+/// handlers can extract both values without one overwriting the other.
+#[derive(Debug, Clone)]
+pub struct ChatFormat(pub Arc<String>);
+
 use axum::{
     middleware,
     routing::{get, post},
@@ -66,8 +81,8 @@ pub fn build_router(
         .route("/health", get(health))
         .layer(Extension(model))
         .layer(Extension(tokenizer))
-        .layer(Extension(model_id))
-        .layer(Extension(Arc::new(chat_format)))
+        .layer(Extension(ModelId(model_id)))
+        .layer(Extension(ChatFormat(Arc::new(chat_format))))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(TimeoutLayer::new(Duration::from_secs(timeout_secs)))
         .layer(cors)

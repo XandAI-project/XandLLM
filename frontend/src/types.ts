@@ -7,11 +7,20 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface GenerationStats {
+  /** Number of completion tokens generated */
+  tokens: number;
+  /** Tokens per second (generation throughput) */
+  tokensPerSec: number;
+}
+
 export interface Message extends ChatMessage {
   id: string;
   createdAt: number;
   /** true while the assistant is still streaming */
   streaming?: boolean;
+  /** Token generation stats, set after streaming completes */
+  stats?: GenerationStats;
 }
 
 // ── Conversations ─────────────────────────────────────────────────────────────

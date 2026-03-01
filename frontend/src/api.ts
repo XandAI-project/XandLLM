@@ -76,7 +76,7 @@ export async function* streamChat(
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
 
-      for (const line of lines) {
+        for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed.startsWith("data:")) continue;
         const data = trimmed.slice(5).trim();
@@ -86,17 +86,21 @@ export async function* streamChat(
           const chunk = JSON.parse(data) as ChatCompletionChunk;
           const choice = chunk.choices[0];
           if (!choice) continue;
-          if (choice.finish_reason === "stop") return;
+          // Yield content BEFORE checking finish_reason — the final chunk may
+          // contain the last token(s) of the response along with stop signal.
           const raw = choice.delta?.content;
-          if (!raw) continue;
-          // Defensive strip: remove any stop tokens that may have slipped through
-          const delta = raw
-            .replace(/<\|im_end\|>/g, "")
-            .replace(/<\|endoftext\|>/g, "")
-            .replace(/<\|eot_id\|>/g, "")
-            .replace(/<\|end_of_text\|>/g, "")
-            .replace(/<\/s>/g, "");
-          if (delta) yield delta;
+          if (raw) {
+            const delta = raw
+              .replace(/<\|im_end\|>/g, "")
+              .replace(/<\|endoftext\|>/g, "")
+              .replace(/<\|eot_id\|>/g, "")
+              .replace(/<\|end_of_text\|>/g, "")
+              .replace(/<\/s>/g, "")
+              .replace(/<\|end\|>/g, "")
+              .replace(/<end_of_turn>/g, "");
+            if (delta) yield delta;
+          }
+          if (choice.finish_reason === "stop") return;
         } catch {
           // malformed chunk — skip
         }

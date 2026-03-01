@@ -1,17 +1,27 @@
 import { useState, useCallback } from "react";
-import type { Conversation, Message, ChatMessage } from "../types";
+import type { Conversation, GenerationStats, Message, ChatMessage } from "../types";
 
 const STORAGE_KEY = "xandllm_conversations";
 
-/** Remove known model end-of-turn tokens that should never appear in stored content. */
 function stripStopTags(text: string): string {
-  return text
+  let result = text
     .replace(/<\|im_end\|>/g, "")
     .replace(/<\|endoftext\|>/g, "")
     .replace(/<\|eot_id\|>/g, "")
     .replace(/<\|end_of_text\|>/g, "")
     .replace(/<\/s>/g, "")
-    .trimEnd();
+    .replace(/<\|end\|>/g, "")
+    .replace(/<end_of_turn>/g, "");
+
+  const rolePattern = /\n(User|Human|Assistant|<\|im_start\|>)\b/;
+  const thinkEnd = result.indexOf("</think>");
+  const searchFrom = thinkEnd !== -1 ? thinkEnd + "</think>".length : 0;
+  const match = rolePattern.exec(result.slice(searchFrom));
+  if (match) {
+    result = result.slice(0, searchFrom + match.index);
+  }
+
+  return result.trimEnd();
 }
 
 function load(): Conversation[] {
@@ -103,7 +113,12 @@ export function useConversations() {
   );
 
   const updateLastAssistantMessage = useCallback(
-    (conversationId: string, content: string, streaming: boolean) => {
+    (
+      conversationId: string,
+      content: string,
+      streaming: boolean,
+      stats?: GenerationStats
+    ) => {
       setConversations((prev) => {
         const next = prev.map((c) => {
           if (c.id !== conversationId) return c;
@@ -113,7 +128,13 @@ export function useConversations() {
             if (messages[i].role === "assistant") { idx = i; break; }
           }
           if (idx === -1) return c;
-          messages[idx] = { ...messages[idx], content, streaming };
+          const finalContent = streaming ? content : stripStopTags(content);
+          messages[idx] = {
+            ...messages[idx],
+            content: finalContent,
+            streaming,
+            ...(stats && { stats }),
+          };
           return { ...c, messages, updatedAt: Date.now() };
         });
         if (!streaming) save(next);
@@ -128,14 +149,13 @@ export function useConversations() {
       const convo = conversations.find((c) => c.id === conversationId);
       if (!convo) return [];
       const history: ChatMessage[] = convo.messages
-        .filter((m) => !m.streaming)
+        .filter((m) => !m.streaming || (m.role === "assistant" && m.content.trim().length > 0))
         .map((m) => ({
           role: m.role,
-          // Strip any stop tokens that may have leaked into stored content.
-          // This prevents stale <|im_end|> etc. from corrupting future prompts.
-          content: stripStopTags(m.content),
+          content: m.role === "assistant"
+            ? stripStopTags(m.content.replace(/<think>[\s\S]*?<\/think>\s*/g, ""))
+            : stripStopTags(m.content),
         }))
-        // Discard empty assistant messages (e.g. aborted turns)
         .filter((m) => m.role !== "assistant" || m.content.trim().length > 0);
       if (systemPrompt) {
         return [{ role: "system", content: systemPrompt }, ...history];
